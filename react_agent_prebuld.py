@@ -83,4 +83,4 @@ while True:
         print("\nWaiter:", ai_messages[-1].content)
     
     # Add AI's response to conversation history
-    conversation_history.extend([("assistant", message.content) for message in result['messages'] if isinstance(message, AIMessage)])
+    conversation_history.append(AIMessage(content=ai_messages[-1].content,name="waiter"))

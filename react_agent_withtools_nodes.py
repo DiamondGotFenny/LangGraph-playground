@@ -1,8 +1,7 @@
 from langchain_core.tools import tool
 import os
 from langchain_openai import AzureChatOpenAI
-from langchain_core.messages import AIMessage
-
+from langchain_core.messages import AIMessage,SystemMessage,HumanMessage
 from langgraph.prebuilt import ToolNode
 from langgraph.graph import StateGraph, END,START,MessagesState
 from langgraph.prebuilt import tools_condition
@@ -26,7 +25,6 @@ def get_drinks_menu() -> str:
 @tool
 def get_food_menu() -> str:
     """Call this to get the food menu."""
-    print("Food Menu:")
     return """
     Food Menu:
     - Burger
@@ -83,7 +81,7 @@ app=workflow.compile()
 
 
 # Initial system message
-system_message = ("system", "You are a restaurant waiter. You will greet the user and serve them with restaurant menus, You can only call tools to answer the user's query. After providing the menu items, always ask user if they need anything else, and guide them to ask for menu items.")
+system_message = SystemMessage(content="You are a restaurant waiter. You will greet the user and serve them with restaurant menus, You can only call tools to answer the user's query. After providing the menu items, always ask user if they need anything else, and guide them to ask for menu items.")
 
 # Initialize conversation history
 conversation_history = [system_message]
@@ -100,7 +98,7 @@ while True:
         break
     
     # Add user message to conversation history
-    conversation_history.append(("user", user_input))
+    conversation_history.append(HumanMessage(content=user_input,name="user"))
     
     # Prepare inputs for the agent
     inputs = {"messages": conversation_history}
@@ -114,7 +112,8 @@ while True:
         print("\nWaiter:", ai_messages[-1].content)
     
     # Add AI's response to conversation history
-    conversation_history.extend([("assistant", message.content) for message in result['messages'] if isinstance(message, AIMessage)])
+    conversation_history.append(AIMessage(content=ai_messages[-1].content,name="waiter"))
+    print("\n chat history", conversation_history)
 
 
 
