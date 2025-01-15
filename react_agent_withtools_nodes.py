@@ -5,6 +5,7 @@ from langchain_core.messages import AIMessage
 
 from langgraph.prebuilt import ToolNode
 from langgraph.graph import StateGraph, END,START,MessagesState
+from langgraph.prebuilt import tools_condition
 
 from dotenv import load_dotenv, find_dotenv
 _ = load_dotenv(find_dotenv())
@@ -62,7 +63,6 @@ def should_continue(state:MessagesState):
 def call_model_with_tools(state:MessagesState):
     messages=state["messages"]
     response=model_with_tools.invoke(messages)
-    print(response)
     return {"messages":[response]}
 
 workflow=StateGraph(MessagesState)
@@ -71,7 +71,11 @@ workflow.add_node("agent",call_model_with_tools)
 workflow.add_node("tools",tool_node)
 
 workflow.add_edge(START,"agent")
-workflow.add_conditional_edges("agent",should_continue,["tools",END])
+# If the latest message (result) from assistant is a tool call -> tools_condition routes to tools
+# # If the latest message (result) from assistant is a not a tool call -> tools_condition routes to END
+# we can use langgraph prebuild 'tools_condition' method, or define by ourself
+#workflow.add_conditional_edges("agent",should_continue,["tools",END])
+workflow.add_conditional_edges('agent',tools_condition)
 workflow.add_edge("tools", "agent")
 
 app=workflow.compile()
