@@ -1,6 +1,6 @@
 
 """
-Expanded waiter_react_agent.py
+waiter_react_agent.py
 
 This script demonstrates an LLM-powered restaurant waiter:
 1. Polite conversation and menu Q&A.
@@ -18,7 +18,7 @@ Requirements:
 import os
 import random
 from dotenv import load_dotenv, find_dotenv
-
+from typing import List, Dict, Union
 # Assuming these modules exist based on your provided code
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI
@@ -228,30 +228,30 @@ def check_payment(amount: float, method: str, order_id: int = 0) -> str:
 
 
 @tool
-def create_order(items: str) -> str:
+def create_order(order_items: List[Dict[str, Union[str, int]]]) -> str:
     """
-    Creates a new order with status 'pending', given an item list in natural language or JSON-like format.
-    For example: 'Bruschetta x2, Lobster Tail x1'.
+    Creates a new order with status 'pending', given a list of order items in JSON format, 
+    for example:
+    [
+        {"name": "Bruschetta", "quantity": 2},
+        {"name": "Lobster Tail", "quantity": 1}
+    ]
     Returns the newly created order ID.
     """
     order_id = get_new_order_id()
-    # Parse items in a naive way (you could get more sophisticated)
-    # Let's assume a simple approach: "Item x2, Another x1"
-    import re
-    pattern = r'([A-Za-z\s\(\)]{2,}x\d+)'
-    found_items = re.findall(pattern, items.replace(',', ''))
 
+    # Convert the incoming list of dicts into our expected "items" structure
     parsed_items = []
-    for match in found_items:
-        # e.g. "Bruschetta x2"
-        # split by ' x'
-        parts = match.strip().split(' x')
-        if len(parts) == 2:
-            item_name = parts[0].strip()
-            qty = int(parts[1])
-            # Initialize item with "pending" status
-            parsed_items.append({"name": item_name, "quantity": qty, "department": "", "status": "pending"})
-
+    for item_info in order_items:
+        item_name = item_info.get("name", "").strip()
+        qty = item_info.get("quantity", 1)
+        parsed_items.append({
+            "name": item_name, 
+            "quantity": qty,
+            "department": "", 
+            "status": "pending"
+        })
+    
     orders[order_id] = {
         "items": parsed_items,
         "status": "pending",
@@ -367,6 +367,13 @@ system_message = SystemMessage(
         "Always remain polite, confirm orders, provide recommendations, and handle small talk briefly "
         "before steering back to restaurant matters. After providing information or fulfilling requests, "
         "ask the user if they need anything else."
+        "When the user wants to order items, call create_order with a JSON list of objects. "
+    "For each item, provide {\\\"name\\\": <str>, \\\"quantity\\\": <int>}. For instance: "
+    "create_order({\\\"order_items\\\": ["
+    "{\\\"name\\\": \\\"Bruschetta\\\", \\\"quantity\\\": 2}, "
+    "{\\\"name\\\": \\\"Lobster Tail\\\", \\\"quantity\\\": 1}"
+    "]})."
+    "Remember only produce valid JSON."
     )
 )
 
