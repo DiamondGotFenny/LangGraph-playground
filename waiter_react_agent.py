@@ -19,14 +19,13 @@ import os
 import random
 from dotenv import load_dotenv, find_dotenv
 from typing import List, Dict, Union
-# Assuming these modules exist based on your provided code
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph import StateGraph, END, START, MessagesState
 
-_ = load_dotenv(find_dotenv())  # Load environment variables if needed
+_ = load_dotenv(find_dotenv()) 
 
 # -------------------------- Menus and Pricing -------------------------- #
 menu_prices = {

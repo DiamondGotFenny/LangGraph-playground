@@ -6,6 +6,8 @@ from langchain_core.messages import AIMessage,SystemMessage,HumanMessage
 from langgraph.prebuilt import ToolNode
 from langgraph.graph import StateGraph, END,START,MessagesState
 from langgraph.prebuilt import tools_condition
+from langgraph.checkpoint.memory import MemorySaver
+
 
 from dotenv import load_dotenv, find_dotenv
 _ = load_dotenv(find_dotenv())
@@ -52,6 +54,8 @@ tools = [get_drinks_menu, get_food_menu]
 tool_node = ToolNode(tools)
 model_with_tools=llm.bind_tools(tools)
 
+memory=MemorySaver()
+
 def should_continue(state:MessagesState):
     messages=state["messages"]
     last_message=messages[-1]
@@ -77,18 +81,18 @@ workflow.add_edge(START,"agent")
 workflow.add_conditional_edges('agent',tools_condition)
 workflow.add_edge("tools", "agent")
 
-app=workflow.compile()
+app=workflow.compile(checkpointer=memory)
+config = {"configurable": {"thread_id": "1"}}
 
 
 
 # Initial system message
-system_message = SystemMessage(content="You are a restaurant waiter. You will greet the user and serve them with restaurant menus, You can only call tools to answer the user's query. After providing the menu items, always ask user if they need anything else, and guide them to ask for menu items.")
+#system_message = SystemMessage(content="You are a restaurant waiter. You will greet the user and serve them with restaurant menus, You can only call tools to answer the user's query. After providing the menu items, always ask user if they need anything else, and guide them to ask for menu items.")
 
 # Initialize conversation history
-conversation_history = [system_message]
+#conversation_history = [system_message]
 
 print("Welcome to the restaurant! Type 'q' to quit the conversation.")
-
 while True:
     # Get user input
     user_input = input("\nYou: ")
@@ -99,13 +103,14 @@ while True:
         break
     
     # Add user message to conversation history
-    conversation_history.append(HumanMessage(content=user_input,name="user"))
+    #conversation_history.append(HumanMessage(content=user_input,name="user"))
     
     # Prepare inputs for the agent
-    inputs = {"messages": conversation_history}
+    #inputs = {"messages": conversation_history}
+    inputs={"messages":[HumanMessage(content=user_input,name="user")]}
     
     # Get response from the agent
-    result = app.invoke(inputs)
+    result = app.invoke(inputs,config=config)
     
      # Print only the last AI message
     ai_messages = [message for message in result['messages'] if isinstance(message, AIMessage)]
@@ -113,8 +118,8 @@ while True:
         print("\nWaiter:", ai_messages[-1].content)
     
     # Add AI's response to conversation history
-    conversation_history.append(AIMessage(content=ai_messages[-1].content,name="waiter"))
-    print("\n chat history", conversation_history)
+    """ conversation_history.append(AIMessage(content=ai_messages[-1].content,name="waiter"))
+    print("\n chat history", conversation_history) """
 
 
 
