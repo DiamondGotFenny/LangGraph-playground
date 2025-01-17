@@ -87,10 +87,12 @@ config = {"configurable": {"thread_id": "1"}}
 
 
 # Initial system message
-#system_message = SystemMessage(content="You are a restaurant waiter. You will greet the user and serve them with restaurant menus, You can only call tools to answer the user's query. After providing the menu items, always ask user if they need anything else, and guide them to ask for menu items.")
+system_message = SystemMessage(content="You are a restaurant waiter. You will greet the user and serve them with restaurant menus, You can only call tools to answer the user's query. After providing the menu items, always ask user if they need anything else, and guide them to ask for menu items.")
 
 # Initialize conversation history
-#conversation_history = [system_message]
+conversation_history = [system_message]
+
+app.invoke({"messages":conversation_history},config=config)
 
 print("Welcome to the restaurant! Type 'q' to quit the conversation.")
 while True:
