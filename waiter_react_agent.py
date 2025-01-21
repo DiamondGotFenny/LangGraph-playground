@@ -26,7 +26,6 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph import StateGraph, END, START, MessagesState
 from logger_config import setup_logger
 
-
 from dotenv import load_dotenv, find_dotenv
 _ = load_dotenv(find_dotenv())
 
@@ -168,7 +167,7 @@ def get_food_menu() -> str:
     """
 
 
-@tool
+
 def check_and_update_stock(item_name: str, quantity: int) -> str:
     """
     Check if the specified item is in stock in the relevant department.
@@ -181,7 +180,7 @@ def check_and_update_stock(item_name: str, quantity: int) -> str:
         if item_name in items:
             if items[item_name] >= quantity:
                 items[item_name] -= quantity
-                logger.info(f"Stock fulfilled: {item_name} x{quantity} from {department}")
+                logger.info(f"Stock fulfilled: {item_name} - {quantity} from {department}")
                 return f"fulfilled in {department}"
             else:
                 logger.warning(f"Insufficient stock for {item_name} in {department}")
@@ -198,6 +197,10 @@ def cashier_calculate_total(order_id: int) -> float:
     Returns the total amount.
     """
     logger.info(f"Calculating total for order {order_id}")
+    if not orders:
+        logger.warning("No orders exist in the system")
+        return "create an order first"
+        
     if order_id not in orders:
         logger.error(f"Order {order_id} not found")
         return 0.0
@@ -319,6 +322,7 @@ def process_order(order_id: int) -> str:
     for item in order_data["items"]:
         if item["status"] == "pending":
             # call tool check_and_update_stock item_name, quantity
+            logger.info(f"Checking stock for {item['name']} x{item['quantity']} in process_order")
             result = check_and_update_stock(item["name"], item["quantity"])
             logger.info(f"Stock check result for {item['name']}: {result} in process_order")
             if "fulfilled" in result:
@@ -351,6 +355,8 @@ AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_4O = os.getenv("OPENAI_MODEL_4o")
 AZURE_API_VERSION = os.getenv("AZURE_API_VERSION")
 
+AZURE_OPENAI_4OMINI= os.getenv("OPENAI_MODEL_4OMINI")
+
 llm = AzureChatOpenAI(
     api_key=AZURE_OPENAI_API_KEY,
     azure_endpoint=AZURE_OPENAI_ENDPOINT,
@@ -359,6 +365,7 @@ llm = AzureChatOpenAI(
     temperature=0.5,
     max_tokens=4000
 )
+
 
 # Add our expanded tools
 tools = [
@@ -376,14 +383,24 @@ model_with_tools = llm.bind_tools(tools)
 def should_continue(state: MessagesState):
     messages = state["messages"]
     last_message = messages[-1]
+    logger.info(f"Last tool message: {last_message}")
     if last_message.tool_calls:
+        logger.info("Last message is a tool call")
         return "tools"
+    logger.info("Last message is not a tool call")
     return END
 
 def call_model_with_tools(state: MessagesState):
     messages = state["messages"]
-    response = model_with_tools.invoke(messages)
-    return {"messages":[response]}
+    try:
+        logger.info(f"LLM input: {messages}")
+        response = model_with_tools.invoke(messages)
+        logger.info(f"LLM response: {response}")
+        return {"messages":[response]}
+    except Exception as e:
+        logger.error(f"LLM invoke error: {str(e)}", exc_info=True)
+        error_message = AIMessage(content="I apologize, but I'm having trouble processing your request. Could you please try again?")
+        return {"messages":[error_message]}
 
 # Build the state graph
 workflow = StateGraph(MessagesState)
@@ -409,13 +426,14 @@ system_message = SystemMessage(
         "Always remain polite, confirm orders, provide recommendations, and handle small talk briefly "
         "before steering back to restaurant matters. After providing information or fulfilling requests, "
         "ask the user if they need anything else."
-        "When the user wants to order items, call create_order with a JSON list of objects. "
+        "always use create_order first before processing an order."
+        "you only need to create one order for all items. then process the order."
+         "When the user wants to order items, call create_order with a JSON list of objects. "
     "For each item, provide {\\\"name\\\": <str>, \\\"quantity\\\": <int>}. For instance: "
     "create_order({\\\"order_items\\\": ["
     "{\\\"name\\\": \\\"Bruschetta\\\", \\\"quantity\\\": 2}, "
     "{\\\"name\\\": \\\"Lobster Tail\\\", \\\"quantity\\\": 1}"
     "]})."
-    "Remember only produce valid JSON."
     )
 )
 
