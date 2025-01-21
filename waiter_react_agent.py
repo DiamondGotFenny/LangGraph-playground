@@ -1,4 +1,3 @@
-
 """
 waiter_react_agent.py
 
@@ -17,6 +16,7 @@ Requirements:
 
 import os
 import random
+from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
 from typing import List, Dict, Union
 from langchain_core.tools import tool
@@ -24,8 +24,31 @@ from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph import StateGraph, END, START, MessagesState
+from logger_config import setup_logger
 
-_ = load_dotenv(find_dotenv()) 
+
+from dotenv import load_dotenv, find_dotenv
+_ = load_dotenv(find_dotenv())
+
+
+def ensure_log_file(log_file_path: str) -> str:
+    """Ensure log file exists, create if it doesn't, and return the path."""
+    log_path = Path(log_file_path)
+    try:
+        # Create parent directories if needed
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Create file if it doesn't exist
+        log_path.touch(exist_ok=True)
+        return str(log_path)
+    except Exception as e:
+        print(f"Warning: Could not create/access log file: {e}")
+        return "waiter_react_agent.log"  # Fallback to current directory
+
+_ = load_dotenv(find_dotenv())
+
+# Setup logger with guaranteed log file
+log_file_path = ensure_log_file("waiter_react_agent.log")
+logger = setup_logger(log_file_path)
 
 # -------------------------- Menus and Pricing -------------------------- #
 menu_prices = {
@@ -153,16 +176,17 @@ def check_and_update_stock(item_name: str, quantity: int) -> str:
     If not enough stock, return 'insufficient_stock'.
     If item not found, return 'item_not_found'.
     """
-    # 1) Find which department has this item
+    logger.info(f"Checking stock for item: {item_name}, quantity: {quantity}")
     for department, items in DEPARTMENT_STOCKS.items():
         if item_name in items:
-            # 2) Check if we have enough stock
             if items[item_name] >= quantity:
-                # reduce stock
                 items[item_name] -= quantity
+                logger.info(f"Stock fulfilled: {item_name} x{quantity} from {department}")
                 return f"fulfilled in {department}"
             else:
+                logger.warning(f"Insufficient stock for {item_name} in {department}")
                 return f"insufficient_stock in {department}"
+    logger.error(f"Item not found in any department: {item_name}")
     return "item_not_found"
 
 
@@ -173,7 +197,9 @@ def cashier_calculate_total(order_id: int) -> float:
     plus 15% tip. Updates the 'total_cost' field in the order.
     Returns the total amount.
     """
+    logger.info(f"Calculating total for order {order_id}")
     if order_id not in orders:
+        logger.error(f"Order {order_id} not found")
         return 0.0
 
     order_data = orders[order_id]
@@ -189,18 +215,21 @@ def cashier_calculate_total(order_id: int) -> float:
 
     # Update order record
     order_data["total_cost"] = total
+    logger.info(f"Order {order_id} total calculated: ${total}")
     return total
 
 
 @tool
-def check_payment(amount: float, method: str, order_id: int = 0) -> str:
+def check_payment(amount: float, method: str, order_id: int ) -> str:
     """
     Processes the payment. 
     - method = "cash": returns "cash_ok" or "insufficient_funds" if amount < total
     - method = "card": 80% chance "valid", 20% chance "invalid"
     If payment is successful, updates order status to "paid".
     """
+    logger.info(f"Processing payment: ${amount} via {method} for order {order_id}")
     if order_id not in orders:
+        logger.error(f"Order {order_id} not found during payment")
         return "order_not_found"
 
     order_data = orders[order_id]
@@ -208,21 +237,26 @@ def check_payment(amount: float, method: str, order_id: int = 0) -> str:
 
     if method.lower() == "cash":
         if amount < total_due:
+            logger.warning(f"Insufficient cash payment: ${amount} < ${total_due}")
             return "insufficient_funds"
         # Payment success; calculate change
         change = round(amount - total_due, 2)
         order_data["status"] = "paid"
+        logger.info(f"Cash payment successful for order {order_id}. Change: ${change}")
         return f"cash_ok with change {change}"
 
     elif method.lower() == "card":
         # 80% success
         if random.random() < 0.8:
             order_data["status"] = "paid"
+            logger.info(f"Card payment successful for order {order_id}")
             return "valid"
         else:
+            logger.warning(f"Card payment failed for order {order_id}")
             return "invalid"
 
     else:
+        logger.error(f"Unknown payment method: {method}")
         return "unknown_method"
 
 
@@ -237,6 +271,7 @@ def create_order(order_items: List[Dict[str, Union[str, int]]]) -> str:
     ]
     Returns the newly created order ID.
     """
+    logger.info(f"Creating new order with items: {order_items}")
     order_id = get_new_order_id()
 
     # Convert the incoming list of dicts into our expected "items" structure
@@ -256,6 +291,7 @@ def create_order(order_items: List[Dict[str, Union[str, int]]]) -> str:
         "status": "pending",
         "total_cost": 0.0,
     }
+    logger.info(f"Order {order_id} created successfully")
     return f"New order {order_id} created with status 'pending'."
 
 
@@ -268,11 +304,15 @@ def process_order(order_id: int) -> str:
        and the overall order might be partially_fulfilled.
     3. If all items fulfilled, order is marked 'fulfilled'.
     """
+    logger.info(f"Processing order {order_id}")
     if order_id not in orders:
+        logger.error(f"Order {order_id} not found")
         return "order_not_found"
     
     order_data = orders[order_id]
+    logger.info(f"Order {order_id} status: {order_data['status']}")
     if order_data["status"] not in ["pending", "partially_fulfilled"]:
+        logger.warning(f"Cannot process order {order_id} in state: {order_data['status']}")
         return f"cannot_process_order_in_state_{order_data['status']}"
 
     all_fulfilled = True
@@ -280,6 +320,7 @@ def process_order(order_id: int) -> str:
         if item["status"] == "pending":
             # call tool check_and_update_stock item_name, quantity
             result = check_and_update_stock(item["name"], item["quantity"])
+            logger.info(f"Stock check result for {item['name']}: {result} in process_order")
             if "fulfilled" in result:
                 # Mark item fulfilled; record department
                 dept = result.split(" in ")[-1]
@@ -293,10 +334,12 @@ def process_order(order_id: int) -> str:
 
     if all_fulfilled:
         order_data["status"] = "fulfilled"
+        logger.info(f"Order {order_id} fully fulfilled")
         return f"Order {order_id} is fully fulfilled."
     else:
         # If at least one item remains "pending", the order is partially fulfilled
         order_data["status"] = "partially_fulfilled"
+        logger.warning(f"Order {order_id} partially fulfilled")
         return f"Order {order_id} is partially fulfilled. Some items are not available or still pending."
 
 
@@ -380,6 +423,7 @@ system_message = SystemMessage(
 conversation_history = [system_message]
 
 if __name__ == "__main__":
+    logger.info("Starting restaurant waiter service")
     print("Welcome to the restaurant! Type 'q' to quit the conversation.")
 
     while True:
@@ -388,25 +432,29 @@ if __name__ == "__main__":
         
         # Check if user wants to quit
         if user_input.lower() == 'q':
+            logger.info("User ended conversation")
             print("Thank you for visiting! Goodbye!")
             break
         
+        logger.info(f"User input: {user_input}")
         # Add user message to conversation history
         conversation_history.append(HumanMessage(content=user_input, name="user"))
         
-        # Prepare inputs for the agent
-        inputs = {"messages": conversation_history}
-        
-        # Get response from the agent
-        result = app.invoke(inputs)
-        
-        # Print only the last AI message
-        ai_messages = [message for message in result['messages'] if isinstance(message, AIMessage)]
-        if ai_messages:
-            print("\nWaiter:", ai_messages[-1].content)
-        
-        # Add AI's response to conversation history
-        conversation_history.append(AIMessage(content=ai_messages[-1].content, name="waiter"))
-        
-        # Debug (optional): see conversation history
-        # print("\n chat history", conversation_history)
+        try:
+            # Prepare inputs for the agent
+            inputs = {"messages": conversation_history}
+            
+            # Get response from the agent
+            result = app.invoke(inputs)
+            
+            # Print only the last AI message
+            ai_messages = [message for message in result['messages'] if isinstance(message, AIMessage)]
+            if ai_messages:
+                print("\nWaiter:", ai_messages[-1].content)
+                logger.info(f"AI response: {ai_messages[-1].content}")
+            
+            # Add AI's response to conversation history
+            conversation_history.append(AIMessage(content=ai_messages[-1].content, name="waiter"))
+        except Exception as e:
+            logger.error(f"Error processing request: {str(e)}", exc_info=True)
+            print("\nWaiter: I apologize, but I encountered an error. How else may I assist you?")
