@@ -1,7 +1,7 @@
 
 from langchain_core.tools import tool
 import os
-from langchain_openai import AzureChatOpenAI
+from langchain_openai import AzureChatOpenAI,ChatOpenAI
 from langchain_core.messages import AIMessage,SystemMessage,HumanMessage
 from langgraph.prebuilt import ToolNode
 from langgraph.graph import StateGraph, END,START,MessagesState
@@ -50,9 +50,21 @@ llm = AzureChatOpenAI(
     max_tokens=3000
 )
 
+DEEPSEEK_ENDPOINT = os.getenv("DEEPSEEK_ENDPOINT")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL")
+deepseek_llm=ChatOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url=DEEPSEEK_ENDPOINT,
+    model=DEEPSEEK_MODEL,
+    temperature=0.5,
+    max_tokens=3000
+)
+    
+
 tools = [get_drinks_menu, get_food_menu]
 tool_node = ToolNode(tools)
-model_with_tools=llm.bind_tools(tools)
+model_with_tools=deepseek_llm.bind_tools(tools)
 
 memory=MemorySaver()
 

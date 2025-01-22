@@ -20,7 +20,7 @@ from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
 from typing import List, Dict, Union
 from langchain_core.tools import tool
-from langchain_openai import AzureChatOpenAI
+from langchain_openai import AzureChatOpenAI,ChatOpenAI
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph import StateGraph, END, START, MessagesState
@@ -74,7 +74,7 @@ initial_stocks = {
     "Pasta Station": {"Spaghetti Carbonara": 15, "Fettuccine Alfredo": 18, "Lasagna": 12},
     "Grill Station": {"Ribeye Steak": 12, "BBQ Ribs": 15, "Grilled Salmon": 18},
     "Cold Station": {"Caesar Salad": 20, "Greek Salad": 15, "Fruit Platter": 10},
-    "Bar": {"Red Wine (glass)": 30, "White Wine (glass)": 30, "Cocktail": 25, "Beer": 40},
+    "Bar": {"Red Wine": 30, "White Wine": 30, "Cocktail": 25, "Beer": 40},
     "Coffee/Tea Bar": {"Espresso": 50, "Cappuccino": 40, "Latte": 45, "Green Tea": 30, "Black Tea": 35},
 }
 
@@ -108,8 +108,8 @@ def get_drinks_menu() -> str:
     """Call this to get the drinks menu."""
     return """
     Drinks Menu:
-    - Red Wine (glass)
-    - White Wine (glass)
+    - Red Wine
+    - White Wine
     - Cocktail
     - Beer
     - Espresso
@@ -367,6 +367,17 @@ llm = AzureChatOpenAI(
 )
 
 
+DEEPSEEK_ENDPOINT = os.getenv("DEEPSEEK_ENDPOINT")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL")
+deepseek_llm=ChatOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url=DEEPSEEK_ENDPOINT,
+    model=DEEPSEEK_MODEL,
+    temperature=0.5,
+    max_tokens=4096
+)
+
 # Add our expanded tools
 tools = [
     get_drinks_menu, 
@@ -378,7 +389,7 @@ tools = [
 ]
 
 tool_node = ToolNode(tools)
-model_with_tools = llm.bind_tools(tools)
+model_with_tools = deepseek_llm.bind_tools(tools)
 
 def should_continue(state: MessagesState):
     messages = state["messages"]
