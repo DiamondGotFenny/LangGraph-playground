@@ -1,16 +1,16 @@
 """
 waiter_react_agent.py
 
-This script demonstrates an LLM-powered restaurant waiter:
+This script demonstrates an LLM-powered restaurant waiter with a custom LangGraph state schema for order tracking:
 1. Polite conversation and menu Q&A.
-2. Order creation with unique order ID and status tracking.
+2. Order creation with unique order ID and status tracking using custom state.
 3. Communication with multiple departments for stock checks and order fulfillment.
 4. Billing and payment (with a 15% tip, random 20% chance of invalid credit card).
 5. Graceful error handling and request for alternate payment method if necessary.
 
 Requirements:
 - python-dotenv for reading environment variables from a .env file (optional).
-- The "langchain_core" and "langgraph" modules in your environment, 
+- The "langchain_core" and "langgraph" modules in your environment,
   or adapt the code to your own tool/chain management libraries.
 """
 
@@ -18,16 +18,15 @@ import os
 import random
 from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Optional, TypedDict,Annotated
 from langchain_core.tools import tool
-from langchain_openai import AzureChatOpenAI,ChatOpenAI
-from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
+from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langchain_core.messages import AIMessage, SystemMessage, HumanMessage,AnyMessage
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.graph import StateGraph, END, START, MessagesState
+from langgraph.graph import StateGraph, END, START,add_messages
 from logger_config import setup_logger
 from langgraph.checkpoint.memory import MemorySaver
 
-from dotenv import load_dotenv, find_dotenv
 _ = load_dotenv(find_dotenv())
 
 
@@ -103,7 +102,20 @@ def get_new_order_id() -> int:
     return order_counter
 
 
+# -------------------------- LangGraph State Definition -------------------------- #
+class RestaurantOrderState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+    order_id: Optional[int]
+    order_items: List[Dict[str, Union[str, int]]]
+    order_status: str  # "pending", "processing", "fulfilled", "billed", "paid", "partially_fulfilled"
+    total_cost: float
+    payment_status: str # "pending", "paid", "failed"
+
+
 # -------------------------- Tools Section -------------------------- #
+from langchain_core.messages import BaseMessage
+
+
 @tool
 def get_drinks_menu() -> str:
     """Call this to get the drinks menu."""
@@ -130,22 +142,22 @@ def get_food_menu() -> str:
     - Bruschetta
     - Caprese Salad
     - Shrimp Cocktail
-    
+
     (Entrées)
     - Salmon Fillet
     - Chicken Breast
     - Vegetable Stir-Fry
-    
+
     (Main Courses)
     - Filet Mignon
     - Lobster Tail
     - Rack of Lamb
-    
+
     (Side Dishes)
     - Mashed Potatoes
     - Grilled Asparagus
     - Roasted Vegetables
-    
+
     (Pasta)
     - Spaghetti Carbonara
     - Fettuccine Alfredo
@@ -201,7 +213,7 @@ def cashier_calculate_total(order_id: int) -> float:
     if not orders:
         logger.warning("No orders exist in the system")
         return "create an order first"
-        
+
     if order_id not in orders:
         logger.error(f"Order {order_id} not found")
         return 0.0
@@ -217,8 +229,7 @@ def cashier_calculate_total(order_id: int) -> float:
     tip_amount = subtotal * 0.15
     total = round(subtotal + tip_amount, 2)
 
-    # Update order record
-    order_data["total_cost"] = total
+   
     logger.info(f"Order {order_id} total calculated: ${total}")
     return total
 
@@ -226,17 +237,17 @@ def cashier_calculate_total(order_id: int) -> float:
 @tool
 def check_payment(amount: float, method: str, order_id: int ) -> str:
     """
-    Processes the payment. 
+    Processes the payment.
     - method = "cash": returns "cash_ok" or "insufficient_funds" if amount < total
     - method = "card": 80% chance "valid", 20% chance "invalid"
     If payment is successful, updates order status to "paid".
     """
     logger.info(f"Processing payment: ${amount} via {method} for order {order_id}")
-    if order_id not in orders:
+    if order_id not in orders: # Accessing global orders is still fine for tool as it's external data
         logger.error(f"Order {order_id} not found during payment")
         return "order_not_found"
 
-    order_data = orders[order_id]
+    order_data = orders[order_id] # Accessing global orders
     total_due = order_data["total_cost"]
 
     if method.lower() == "cash":
@@ -245,14 +256,14 @@ def check_payment(amount: float, method: str, order_id: int ) -> str:
             return "insufficient_funds"
         # Payment success; calculate change
         change = round(amount - total_due, 2)
-        order_data["status"] = "paid"
+        # order_data["status"] = "paid" # No longer directly updating global orders
         logger.info(f"Cash payment successful for order {order_id}. Change: ${change}")
         return f"cash_ok with change {change}"
 
     elif method.lower() == "card":
         # 80% success
         if random.random() < 0.8:
-            order_data["status"] = "paid"
+            # order_data["status"] = "paid" # No longer directly updating global orders
             logger.info(f"Card payment successful for order {order_id}")
             return "valid"
         else:
@@ -267,7 +278,7 @@ def check_payment(amount: float, method: str, order_id: int ) -> str:
 @tool
 def create_order(order_items: List[Dict[str, Union[str, int]]]) -> str:
     """
-    Creates a new order with status 'pending', given a list of order items in JSON format, 
+    Creates a new order with status 'pending', given a list of order items in JSON format,
     for example:
     [
         {"name": "Bruschetta", "quantity": 2},
@@ -275,6 +286,7 @@ def create_order(order_items: List[Dict[str, Union[str, int]]]) -> str:
     ]
     Returns the newly created order ID.
     """
+    global orders # Still using global orders for simplicity in this example - can be moved to state later if needed
     logger.info(f"Creating new order with items: {order_items}")
     order_id = get_new_order_id()
 
@@ -284,13 +296,13 @@ def create_order(order_items: List[Dict[str, Union[str, int]]]) -> str:
         item_name = item_info.get("name", "").strip()
         qty = item_info.get("quantity", 1)
         parsed_items.append({
-            "name": item_name, 
+            "name": item_name,
             "quantity": qty,
-            "department": "", 
+            "department": "",
             "status": "pending"
         })
-    
-    orders[order_id] = {
+
+    orders[order_id] = { # Still using global orders
         "items": parsed_items,
         "status": "pending",
         "total_cost": 0.0,
@@ -304,16 +316,17 @@ def process_order(order_id: int) -> str:
     """
     Processes an existing order:
     1. Checks each item's department stock via check_and_update_stock.
-    2. If insufficient stock for any item, that item remains pending, 
+    2. If insufficient stock for any item, that item remains pending,
        and the overall order might be partially_fulfilled.
     3. If all items fulfilled, order is marked 'fulfilled'.
     """
+    global orders # Still using global orders for simplicity
     logger.info(f"Processing order {order_id}")
-    if order_id not in orders:
+    if order_id not in orders: # Accessing global orders
         logger.error(f"Order {order_id} not found")
         return "order_not_found"
-    
-    order_data = orders[order_id]
+
+    order_data = orders[order_id] # Accessing global orders
     logger.info(f"Order {order_id} status: {order_data['status']}")
     if order_data["status"] not in ["pending", "partially_fulfilled"]:
         logger.warning(f"Cannot process order {order_id} in state: {order_data['status']}")
@@ -338,12 +351,12 @@ def process_order(order_id: int) -> str:
                 all_fulfilled = False
 
     if all_fulfilled:
-        order_data["status"] = "fulfilled"
+        order_data["status"] = "fulfilled" # Updating global orders
         logger.info(f"Order {order_id} fully fulfilled")
         return f"Order {order_id} is fully fulfilled."
     else:
         # If at least one item remains "pending", the order is partially fulfilled
-        order_data["status"] = "partially_fulfilled"
+        order_data["status"] = "partially_fulfilled" # Updating global orders
         logger.warning(f"Order {order_id} partially fulfilled")
         return f"Order {order_id} is partially fulfilled. Some items are not available or still pending."
 
@@ -381,8 +394,8 @@ deepseek_llm=ChatOpenAI(
 
 # Add our expanded tools
 tools = [
-    get_drinks_menu, 
-    get_food_menu, 
+    get_drinks_menu,
+    get_food_menu,
     create_order,
     process_order,
     cashier_calculate_total,
@@ -392,8 +405,9 @@ tools = [
 tool_node = ToolNode(tools)
 model_with_tools = deepseek_llm.bind_tools(tools)
 
-def should_continue(state: MessagesState):
-    messages = state["messages"]
+
+def should_continue(state: RestaurantOrderState): # Updated state type
+    messages = state['messages']
     last_message = messages[-1]
     logger.info(f"Last tool message: {last_message}")
     if last_message.tool_calls:
@@ -402,28 +416,35 @@ def should_continue(state: MessagesState):
     logger.info("Last message is not a tool call")
     return END
 
-def call_model_with_tools(state: MessagesState):
-    messages = state["messages"]
+def call_model_with_tools(state: RestaurantOrderState): # Updated state type
+    messages = state['messages']
     try:
         logger.info(f"LLM input: {messages}")
         response = model_with_tools.invoke(messages)
         logger.info(f"LLM response: {response}")
-        return {"messages":[response]}
+        return {"messages":[response],
+                "order_id": state['order_id'], 
+                "order_items": state['order_items'],
+                "order_status": state['order_status'],
+                "total_cost": state['total_cost'],
+                "payment_status": state['payment_status']}
     except Exception as e:
         logger.error(f"LLM invoke error: {str(e)}", exc_info=True)
         error_message = AIMessage(content="I apologize, but I'm having trouble processing your request. Could you please try again?")
-        return {"messages":[error_message]}
+        return {"messages":[error_message], 
+                "order_id": state['order_id'],
+                "order_items": state['order_items'],
+                "order_status": state['order_status'],
+                "total_cost": state['total_cost'],
+                "payment_status": state['payment_status']}
 
 # Build the state graph
-
-workflow = StateGraph(MessagesState)
+workflow = StateGraph(RestaurantOrderState) # Use custom state schema
 memory=MemorySaver()
 workflow.add_node("agent", call_model_with_tools)
 workflow.add_node("tools", tool_node)
 
 workflow.add_edge(START, "agent")
-# If the latest message from assistant is a tool call -> tools_condition routes to tools
-# If the latest message from assistant is not a tool call -> route to END
 workflow.add_conditional_edges('agent', tools_condition)
 workflow.add_edge("tools", "agent")
 
@@ -451,43 +472,63 @@ system_message = SystemMessage(
     )
 )
 
-# Initialize conversation history
-conversation_history = [system_message]
-
 
 if __name__ == "__main__":
-    logger.info("Starting restaurant waiter service")
+    logger.info("Starting restaurant waiter service with custom state")
     print("Welcome to the restaurant! Type 'q' to quit the conversation.")
-    app.invoke({"messages":conversation_history},config=config)
+
+    # Initialize state with default values
+    initial_state: RestaurantOrderState = {
+        "messages": [system_message],
+        "order_id": 0,
+        "order_items": [],
+        "order_status": "pending",
+        "total_cost": 0.0,
+        "payment_status": "pending"
+    }
+
+    app.invoke(initial_state, config=config) # Invoke with initial state
+
     while True:
         # Get user input
         user_input = input("\nYou: ")
-        
+
         # Check if user wants to quit
         if user_input.lower() == 'q':
             logger.info("User ended conversation")
             print("Thank you for visiting! Goodbye!")
             break
-        
+
         logger.info(f"User input: {user_input}")
-        # Add user message to conversation history
-        conversation_history.append(HumanMessage(content=user_input, name="user"))
-        
+
+        # Create a new user message
+        user_message = HumanMessage(content=user_input, name="user")
+
+        # Update the state with the new user message
+        current_state = app.get_state(config) 
+        updated_state: RestaurantOrderState = {
+            "messages":  list(current_state[0]['messages']) + [user_message] , 
+           "order_id":  current_state[0]['order_id'],
+        "order_items": current_state[0]['order_items'],
+        "order_status": current_state[0]['order_status'],
+        "total_cost": current_state[0]['total_cost'],
+        "payment_status": current_state[0]['payment_status']
+        }
+
+
         try:
-            # Prepare inputs for the agent
-            inputs = {"messages": HumanMessage(content=user_input, name="user")}
-            
+            # Prepare inputs for the agent (now passing the entire state)
+            inputs = updated_state 
+
             # Get response from the agent
-            result = app.invoke(inputs,config=config)
-            
+            result = app.invoke(inputs, config=config)
+
             # Print only the last AI message
             ai_messages = [message for message in result['messages'] if isinstance(message, AIMessage)]
             if ai_messages:
                 print("\nWaiter:", ai_messages[-1].content)
                 logger.info(f"AI response: {ai_messages[-1].content}")
-            
-            # Add AI's response to conversation history
-            conversation_history.append(AIMessage(content=ai_messages[-1].content, name="waiter"))
+
         except Exception as e:
             logger.error(f"Error processing request: {str(e)}", exc_info=True)
             print("\nWaiter: I apologize, but I encountered an error. How else may I assist you?")
