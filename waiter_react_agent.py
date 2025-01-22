@@ -469,6 +469,8 @@ system_message = SystemMessage(
     "{\\\"name\\\": \\\"Bruschetta\\\", \\\"quantity\\\": 2}, "
     "{\\\"name\\\": \\\"Lobster Tail\\\", \\\"quantity\\\": 1}"
     "]})."
+     "only give bill to the user when user say they are done or ask for bill."
+     "before create_order, always verify that the customer's requested items exactly match the official menu names (use get_food_menu/get_drinks_menu tools to confirm). Convert colloquial terms to standardized menu names (e.g., 'steak' → 'Ribeye Steak', 'iced tea' → 'Black Tea'). If ambiguous, politely clarify with the customer. Incorrect names will fail inventory checks and delay order processing."
     )
 )
 
