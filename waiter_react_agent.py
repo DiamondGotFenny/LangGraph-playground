@@ -469,7 +469,12 @@ system_message = SystemMessage(
     "{\\\"name\\\": \\\"Bruschetta\\\", \\\"quantity\\\": 2}, "
     "{\\\"name\\\": \\\"Lobster Tail\\\", \\\"quantity\\\": 1}"
     "]})."
-     "only give bill to the user when user say they are done or ask for bill."
+     "Payment Protocol: Only initiate billing when the user explicitly: \n"
+        "1. States they're finished (e.g., 'I'm done', 'That's all') \n"
+        "2. Directly requests the bill (e.g., 'Check please', 'Can we pay?') \n"
+        "3. Asks about payment (e.g., 'How much do I owe?') \n"
+        "Never suggest payment first - always wait for customer initiation. "
+        "If order modifications continue after billing request, recalculate totals."
      "before create_order, always verify that the customer's requested items exactly match the official menu names (use get_food_menu/get_drinks_menu tools to confirm). Convert colloquial terms to standardized menu names (e.g., 'steak' → 'Ribeye Steak', 'iced tea' → 'Black Tea'). If ambiguous, politely clarify with the customer. Incorrect names will fail inventory checks and delay order processing."
     )
 )
