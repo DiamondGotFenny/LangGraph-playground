@@ -25,6 +25,7 @@ from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph import StateGraph, END, START, MessagesState
 from logger_config import setup_logger
+from langgraph.checkpoint.memory import MemorySaver
 
 from dotenv import load_dotenv, find_dotenv
 _ = load_dotenv(find_dotenv())
@@ -414,8 +415,9 @@ def call_model_with_tools(state: MessagesState):
         return {"messages":[error_message]}
 
 # Build the state graph
-workflow = StateGraph(MessagesState)
 
+workflow = StateGraph(MessagesState)
+memory=MemorySaver()
 workflow.add_node("agent", call_model_with_tools)
 workflow.add_node("tools", tool_node)
 
@@ -425,7 +427,8 @@ workflow.add_edge(START, "agent")
 workflow.add_conditional_edges('agent', tools_condition)
 workflow.add_edge("tools", "agent")
 
-app = workflow.compile()
+app = workflow.compile(checkpointer=memory)
+config = {"configurable": {"thread_id": "1"}}
 
 # Initial system message
 system_message = SystemMessage(
@@ -451,10 +454,11 @@ system_message = SystemMessage(
 # Initialize conversation history
 conversation_history = [system_message]
 
+
 if __name__ == "__main__":
     logger.info("Starting restaurant waiter service")
     print("Welcome to the restaurant! Type 'q' to quit the conversation.")
-
+    app.invoke({"messages":conversation_history},config=config)
     while True:
         # Get user input
         user_input = input("\nYou: ")
@@ -471,10 +475,10 @@ if __name__ == "__main__":
         
         try:
             # Prepare inputs for the agent
-            inputs = {"messages": conversation_history}
+            inputs = {"messages": HumanMessage(content=user_input, name="user")}
             
             # Get response from the agent
-            result = app.invoke(inputs)
+            result = app.invoke(inputs,config=config)
             
             # Print only the last AI message
             ai_messages = [message for message in result['messages'] if isinstance(message, AIMessage)]
