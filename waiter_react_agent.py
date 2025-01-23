@@ -18,7 +18,9 @@ import os
 import random
 from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
-from typing import List, Dict, Union, Optional, TypedDict,Annotated
+from pydantic import BaseModel, Field, field_validator, ValidationError
+from typing import List, Dict, Union, Optional, Literal,TypedDict
+from typing_extensions import Annotated
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage,AnyMessage
@@ -103,13 +105,103 @@ def get_new_order_id() -> int:
 
 
 # -------------------------- LangGraph State Definition -------------------------- #
+class OrderItem(BaseModel):
+    """Represents a single item in an order"""
+    name: str
+    quantity: int = Field(gt=0)  # Ensure quantity is greater than 0
+    department: str = ""
+    status: Literal["pending", "fulfilled"] = "pending"
+
+    @field_validator('name')
+    @classmethod
+    def validate_menu_item(cls, value):
+        if value not in menu_prices:
+            raise ValueError(f"Item '{value}' is not in the menu")
+        return value
+
+    @field_validator('quantity')
+    @classmethod
+    def validate_quantity(cls, value):
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError("Quantity must be a positive integer")
+        return value
+
+class RestaurantOrderStateModel(BaseModel):
+    """Pydantic model for restaurant order state"""
+    messages: Annotated[List[AnyMessage], add_messages]
+    order_id: Optional[int] = Field(default=0, description="Unique identifier for the order")
+    order_items: List[OrderItem] = Field(default_factory=list, description="List of items in the order")
+    order_status: Literal["pending", "processing", "fulfilled", "billed", "paid", "partially_fulfilled"] = Field(
+        default="pending",
+        description="Current status of the order"
+    )
+    total_cost: float = Field(default=0.0, ge=0, description="Total cost of the order")
+    payment_status: Literal["pending", "paid", "failed"] = Field(
+        default="pending",
+        description="Status of payment"
+    )
+
+    @field_validator('total_cost')
+    @classmethod
+    def validate_total_cost(cls, value):
+        if value < 0:
+            raise ValueError("Total cost cannot be negative")
+        return value
+
+    @field_validator('order_status')
+    @classmethod
+    def validate_order_status(cls, value):
+        valid_statuses = ["pending", "processing", "fulfilled", "billed", "paid", "partially_fulfilled"]
+        if value not in valid_statuses:
+            raise ValueError(f"Invalid order status. Must be one of: {', '.join(valid_statuses)}")
+        return value
+
+    @field_validator('payment_status')
+    @classmethod
+    def validate_payment_status(cls, value):
+        valid_statuses = ["pending", "paid", "failed"]
+        if value not in valid_statuses:
+            raise ValueError(f"Invalid payment status. Must be one of: {', '.join(valid_statuses)}")
+        return value
+
+    class Config:
+        arbitrary_types_allowed = True
+
 class RestaurantOrderState(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
+    messages: Annotated[List[AnyMessage], add_messages]
     order_id: Optional[int]
     order_items: List[Dict[str, Union[str, int]]]
-    order_status: str  # "pending", "processing", "fulfilled", "billed", "paid", "partially_fulfilled"
+    order_status: str
     total_cost: float
-    payment_status: str # "pending", "paid", "failed"
+    payment_status: str
+
+    @classmethod
+    def validate_state(cls, state_dict: dict) -> 'RestaurantOrderState':
+        """Validate state using Pydantic model"""
+        try:
+            # Convert order_items to proper format for Pydantic validation
+            if "order_items" in state_dict:
+                state_dict["order_items"] = [
+                    OrderItem(**item) if isinstance(item, dict) else item
+                    for item in state_dict["order_items"]
+                ]
+            
+            # Validate using Pydantic model
+            validated = RestaurantOrderStateModel(**state_dict)
+            
+            # Convert back to TypedDict format
+            return cls(
+                messages=validated.messages,
+                order_id=validated.order_id,
+                order_items=[item.dict() for item in validated.order_items],
+                order_status=validated.order_status,
+                total_cost=validated.total_cost,
+                payment_status=validated.payment_status
+            )
+        except ValidationError as e:
+            logger.error(f"State validation error: {str(e)}")
+            raise
+
 
 
 # -------------------------- Tools Section -------------------------- #
@@ -286,29 +378,25 @@ def create_order(order_items: List[Dict[str, Union[str, int]]]) -> str:
     ]
     Returns the newly created order ID.
     """
-    global orders # Still using global orders for simplicity in this example - can be moved to state later if needed
-    logger.info(f"Creating new order with items: {order_items}")
-    order_id = get_new_order_id()
+    try:
+        # Validate order items using Pydantic
+        validated_items = [OrderItem(**item) for item in order_items]
+        
+        global orders
+        logger.info(f"Creating new order with items: {validated_items}")
+        order_id = get_new_order_id()
 
-    # Convert the incoming list of dicts into our expected "items" structure
-    parsed_items = []
-    for item_info in order_items:
-        item_name = item_info.get("name", "").strip()
-        qty = item_info.get("quantity", 1)
-        parsed_items.append({
-            "name": item_name,
-            "quantity": qty,
-            "department": "",
-            "status": "pending"
-        })
-
-    orders[order_id] = { # Still using global orders
-        "items": parsed_items,
-        "status": "pending",
-        "total_cost": 0.0,
-    }
-    logger.info(f"Order {order_id} created successfully")
-    return f"New order {order_id} created with status 'pending'."
+        orders[order_id] = {
+            "items": [item.model_dump() for item in validated_items],
+            "status": "pending",
+            "total_cost": 0.0,
+        }
+        logger.info(f"Order {order_id} created successfully")
+        return f"New order {order_id} created with status 'pending'."
+        
+    except ValidationError as e:
+        logger.error(f"Order validation error: {str(e)}")
+        return f"Error creating order: {str(e)}"
 
 
 @tool
@@ -405,7 +493,7 @@ tools = [
 tool_node = ToolNode(tools)
 model_with_tools = deepseek_llm.bind_tools(tools)
 
-
+#custom tools condition, can be modified and used in the workflow with workflow.add_conditional_edges if needed
 def should_continue(state: RestaurantOrderState): # Updated state type
     messages = state['messages']
     last_message = messages[-1]
@@ -452,7 +540,10 @@ app = workflow.compile(checkpointer=memory)
 config = {"configurable": {"thread_id": "1"}}
 
 # Initial system message
-system_message = SystemMessage(
+
+def create_initial_state() -> RestaurantOrderState:
+    """Create and validate initial state"""
+    system_message = SystemMessage(
     content=(
         "You are a restaurant waiter. You will greet the user and serve them with restaurant menus, "
         "manage orders, check availability, handle billing and payments, and communicate with the "
@@ -479,13 +570,8 @@ system_message = SystemMessage(
     )
 )
 
-
-if __name__ == "__main__":
-    logger.info("Starting restaurant waiter service with custom state")
-    print("Welcome to the restaurant! Type 'q' to quit the conversation.")
-
-    # Initialize state with default values
-    initial_state: RestaurantOrderState = {
+    
+    initial_state = {
         "messages": [system_message],
         "order_id": 0,
         "order_items": [],
@@ -493,49 +579,57 @@ if __name__ == "__main__":
         "total_cost": 0.0,
         "payment_status": "pending"
     }
-
-    app.invoke(initial_state, config=config) # Invoke with initial state
-
-    while True:
-        # Get user input
-        user_input = input("\nYou: ")
-
-        # Check if user wants to quit
-        if user_input.lower() == 'q':
-            logger.info("User ended conversation")
-            print("Thank you for visiting! Goodbye!")
-            break
-
-        logger.info(f"User input: {user_input}")
-
-        # Create a new user message
-        user_message = HumanMessage(content=user_input, name="user")
-
-        # Update the state with the new user message
-        current_state = app.get_state(config) 
-        updated_state: RestaurantOrderState = {
-            "messages":  list(current_state[0]['messages']) + [user_message] , 
-           "order_id":  current_state[0]['order_id'],
-        "order_items": current_state[0]['order_items'],
-        "order_status": current_state[0]['order_status'],
-        "total_cost": current_state[0]['total_cost'],
-        "payment_status": current_state[0]['payment_status']
-        }
+    
+    return RestaurantOrderState.validate_state(initial_state)
 
 
-        try:
-            # Prepare inputs for the agent (now passing the entire state)
-            inputs = updated_state 
+if __name__ == "__main__":
+    logger.info("Starting restaurant waiter service with custom state")
+    print("Welcome to the restaurant! Type 'q' to quit the conversation.")
 
-            # Get response from the agent
-            result = app.invoke(inputs, config=config)
+    try:
+        # Initialize state with validation
+        initial_state = create_initial_state()
+        result=app.invoke(initial_state, config=config)
+        ai_messages = [msg for msg in result['messages'] if isinstance(msg, AIMessage)]
+        if ai_messages:
+            print("\nWaiter:", ai_messages[-1].content)
+            logger.info(f"AI response: {ai_messages[-1].content}")
+        while True:
+            user_input = input("\nYou: ")
+            
+            if user_input.lower() == 'q':
+                logger.info("User ended conversation")
+                print("Thank you for visiting! Goodbye!")
+                break
 
-            # Print only the last AI message
-            ai_messages = [message for message in result['messages'] if isinstance(message, AIMessage)]
-            if ai_messages:
-                print("\nWaiter:", ai_messages[-1].content)
-                logger.info(f"AI response: {ai_messages[-1].content}")
+            logger.info(f"User input: {user_input}")
+            user_message = HumanMessage(content=user_input, name="user")
 
-        except Exception as e:
-            logger.error(f"Error processing request: {str(e)}", exc_info=True)
-            print("\nWaiter: I apologize, but I encountered an error. How else may I assist you?")
+            try:
+                # Update state with validation
+                current_state = app.get_state(config)
+                updated_state_dict = {
+                    "messages": list(current_state[0]['messages']) + [user_message],
+                    "order_id": current_state[0]['order_id'],
+                    "order_items": current_state[0]['order_items'],
+                    "order_status": current_state[0]['order_status'],
+                    "total_cost": current_state[0]['total_cost'],
+                    "payment_status": current_state[0]['payment_status']
+                }
+                
+                validated_state = RestaurantOrderState.validate_state(updated_state_dict)
+                result = app.invoke(validated_state, config=config)
+
+                ai_messages = [msg for msg in result['messages'] if isinstance(msg, AIMessage)]
+                if ai_messages:
+                    print("\nWaiter:", ai_messages[-1].content)
+                    logger.info(f"AI response: {ai_messages[-1].content}")
+
+            except ValidationError as e:
+                logger.error(f"State validation error: {str(e)}")
+                print("\nWaiter: I apologize, but there was an error with your order. Please try again.")
+                
+    except Exception as e:
+        logger.error(f"Critical error: {str(e)}", exc_info=True)
+        print("\nWaiter: I apologize, but our system is currently unavailable. Please try again later.")
