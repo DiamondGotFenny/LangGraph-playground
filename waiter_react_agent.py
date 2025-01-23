@@ -271,7 +271,42 @@ def get_food_menu() -> str:
     - Tiramisu
     """
 
-
+@tool
+def get_restaurant_info() -> str:
+    """Call this to get information about the restaurant, including its history, hours, and accolades."""
+    return """
+    === VILLA TOSCANA ===
+    
+    🏰 About Us:
+    Established in 1985, Villa Toscana sits in a restored 19th-century mansion in the heart of the city. 
+    Our restaurant brings authentic Tuscan flavors with a modern twist to your table.
+    
+    👨‍🍳 Our Team:
+    - Owner: Marco Rossi (3rd generation restaurateur)
+    - Executive Chef: Isabella Chen
+        - Former sous chef at 3-Michelin-starred Le Bernardin
+        - James Beard Rising Star Chef 2022
+    - Sommelier: James Thompson (Court of Master Sommeliers certified)
+    
+    🏆 Awards & Recognition:
+    - Michelin Star (2020-2024)
+    - Wine Spectator Award of Excellence (2018-2024)
+    - Best Italian Restaurant - City Dining Awards 2023
+    - "Top 50 Restaurants in America" - Bon Appétit Magazine 2022
+    
+    ⏰ Hours of Operation:
+    - Lunch: Tuesday-Sunday, 11:30 AM - 2:30 PM
+    - Dinner: Tuesday-Sunday, 5:30 PM - 10:00 PM
+    - Closed on Mondays
+    
+    🎉 Special Events:
+    - Weekly wine tasting events (Thursday evenings)
+    - Monthly cooking classes with Chef Isabella
+    - Private dining rooms available for special occasions
+    
+    For reservations: +1 (555) 123-4567
+    Address: 123 Olive Garden Street, Metropolis, MB 12345
+    """
 
 def check_and_update_stock(item_name: str, quantity: int) -> str:
     """
@@ -487,7 +522,8 @@ tools = [
     create_order,
     process_order,
     cashier_calculate_total,
-    check_payment
+    check_payment,
+    get_restaurant_info
 ]
 
 tool_node = ToolNode(tools)
@@ -545,28 +581,32 @@ def create_initial_state() -> RestaurantOrderState:
     """Create and validate initial state"""
     system_message = SystemMessage(
     content=(
-        "You are a restaurant waiter. You will greet the user and serve them with restaurant menus, "
-        "manage orders, check availability, handle billing and payments, and communicate with the "
-        "virtual restaurant departments to fulfill orders. "
+       "You are a waiter at Villa Toscana, an upscale Italian restaurant. You will greet the user and serve them "
+        "with restaurant menus, manage orders, check availability, handle billing and payments, and communicate with "
+        "the virtual restaurant departments to fulfill orders. You can provide information about our restaurant's "
+        "history, team, and accolades when asked. "
         "You can only call tools to answer the user's query or perform operations. "
         "Always remain polite, confirm orders, provide recommendations, and handle small talk briefly "
         "before steering back to restaurant matters. After providing information or fulfilling requests, "
         "ask the user if they need anything else."
-        "always use create_order first before processing an order."
-        "you only need to create one order for all items. then process the order."
-         "When the user wants to order items, call create_order with a JSON list of objects. "
-    "For each item, provide {\\\"name\\\": <str>, \\\"quantity\\\": <int>}. For instance: "
-    "create_order({\\\"order_items\\\": ["
-    "{\\\"name\\\": \\\"Bruschetta\\\", \\\"quantity\\\": 2}, "
-    "{\\\"name\\\": \\\"Lobster Tail\\\", \\\"quantity\\\": 1}"
-    "]})."
-     "Payment Protocol: Only initiate billing when the user explicitly: \n"
+        "Always use create_order first before processing an order."
+        "You only need to create one order for all items, then process the order."
+        "When the user wants to order items, call create_order with a JSON list of objects. "
+        "For each item, provide {\\\"name\\\": <str>, \\\"quantity\\\": <int>}. For instance: "
+        "create_order({\\\"order_items\\\": ["
+        "{\\\"name\\\": \\\"Bruschetta\\\", \\\"quantity\\\": 2}, "
+        "{\\\"name\\\": \\\"Lobster Tail\\\", \\\"quantity\\\": 1}"
+        "]})."
+        "Payment Protocol: Only initiate billing when the user explicitly: \n"
         "1. States they're finished (e.g., 'I'm done', 'That's all') \n"
         "2. Directly requests the bill (e.g., 'Check please', 'Can we pay?') \n"
         "3. Asks about payment (e.g., 'How much do I owe?') \n"
         "Never suggest payment first - always wait for customer initiation. "
         "If order modifications continue after billing request, recalculate totals."
-     "before create_order, always verify that the customer's requested items exactly match the official menu names (use get_food_menu/get_drinks_menu tools to confirm). Convert colloquial terms to standardized menu names (e.g., 'steak' → 'Ribeye Steak', 'iced tea' → 'Black Tea'). If ambiguous, politely clarify with the customer. Incorrect names will fail inventory checks and delay order processing."
+        "Before create_order, always verify that the customer's requested items exactly match the official menu names "
+        "(use get_food_menu/get_drinks_menu tools to confirm). Convert colloquial terms to standardized menu names "
+        "(e.g., 'steak' → 'Ribeye Steak', 'iced tea' → 'Black Tea'). If ambiguous, politely clarify with the customer. "
+        "Incorrect names will fail inventory checks and delay order processing."
     )
 )
 
