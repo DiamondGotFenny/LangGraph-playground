@@ -1,3 +1,4 @@
+####################
 """
 waiter_react_agent.py
 
@@ -23,7 +24,7 @@ from typing import List, Dict, Union, Optional, Literal,TypedDict
 from typing_extensions import Annotated
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
-from langchain_core.messages import AIMessage, SystemMessage, HumanMessage,AnyMessage
+from langchain_core.messages import AIMessage, SystemMessage, HumanMessage,AnyMessage,RemoveMessage
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph import StateGraph, END, START,add_messages
 from logger_config import setup_logger
@@ -61,7 +62,7 @@ menu_prices = {
     "Spaghetti Carbonara": 16.00, "Fettuccine Alfredo": 17.00, "Lasagna": 19.00,
     "Ribeye Steak": 30.00, "BBQ Ribs": 25.00, "Grilled Salmon": 28.00,
     "Caesar Salad": 10.00, "Greek Salad": 9.50, "Fruit Platter": 12.00,
-    "Red Wine (glass)": 9.00, "White Wine (glass)": 9.00, "Cocktail": 12.00,
+    "Red Wine": 9.00, "White Wine": 9.00, "Cocktail": 12.00,
     "Beer": 7.00, "Espresso": 3.00, "Cappuccino": 4.50, "Latte": 4.50,
     "Green Tea": 3.50, "Black Tea": 3.50,
 }
@@ -93,7 +94,41 @@ DEPARTMENT_STOCKS = {dept: dict(items) for dept, items in initial_stocks.items()
 # }
 orders = {}
 order_counter = 0
-
+system_message = SystemMessage(
+    content=(
+       "You are a waiter at Villa Toscana, an upscale Italian restaurant. You will greet the user and serve them "
+        "with restaurant menus, manage orders, check availability, handle billing and payments, and communicate with "
+        "the virtual restaurant departments to fulfill orders. You can provide information about our restaurant's "
+        "history, team, and accolades when asked. "
+        "You can only call tools to answer the user's query or perform operations. "
+        "Always remain polite, confirm orders, provide recommendations, and handle small talk briefly "
+        "before steering back to restaurant matters. After providing information or fulfilling requests, "
+        "ask the user if they need anything else."
+        "Always use create_order first before processing an order."
+        "You only need to create one order for all items, then process the order."
+        "When the user wants to order items, call create_order with a JSON list of objects. "
+        "For each item, provide {\\\"name\\\": <str>, \\\"quantity\\\": <int>}. For instance: "
+        "create_order({\\\"order_items\\\": ["
+        "{\\\"name\\\": \\\"Bruschetta\\\", \\\"quantity\\\": 2}, "
+        "{\\\"name\\\": \\\"Lobster Tail\\\", \\\"quantity\\\": 1}"
+        "]})."
+        "Payment Protocol: Only initiate billing when the user explicitly: \n"
+        "1. States they're finished (e.g., 'I'm done', 'That's all') \n"
+        "2. Directly requests the bill (e.g., 'Check please', 'Can we pay?') \n"
+        "3. Asks about payment (e.g., 'How much do I owe?') \n"
+        "Never suggest payment first - always wait for customer initiation. "
+        "If order modifications continue after billing request, recalculate totals."
+        "Before create_order, always verify that the customer's requested items exactly match the official menu names "
+        " Convert colloquial terms to standardized menu names "
+        "(e.g., 'steak' → 'Ribeye Steak', 'iced tea' → 'Black Tea'). If ambiguous, politely clarify with the customer. "
+        "Incorrect names will fail inventory checks and delay order processing."
+        "To not call these tools unnecessarily in other situations."
+        "When the user asks about the price of a specific item, "
+        "use the get_menu_item_price tool to provide accurate pricing information. "
+        "Always verify the exact menu name before checking prices."
+        "To use 'get_food_menu' and 'get_drinks_menu' only when the user explicitly asks for the menu(e.g., \"show me the menu,\" \"can I see the menu?\") or verify the exact menu item name, if there is no full menu in the conversation history."
+    )
+)
 
 def get_new_order_id() -> int:
     """
@@ -140,6 +175,8 @@ class RestaurantOrderStateModel(BaseModel):
         default="pending",
         description="Status of payment"
     )
+    conversation_rounds: int = Field(default=0, description="Number of conversation exchanges")
+    summary: str = Field(default="", description="Condensed conversation summary")
 
     @field_validator('total_cost')
     @classmethod
@@ -174,6 +211,8 @@ class RestaurantOrderState(TypedDict):
     order_status: str
     total_cost: float
     payment_status: str
+    conversation_rounds: int
+    summary: str
 
     @classmethod
     def validate_state(cls, state_dict: dict) -> 'RestaurantOrderState':
@@ -185,18 +224,20 @@ class RestaurantOrderState(TypedDict):
                     OrderItem(**item) if isinstance(item, dict) else item
                     for item in state_dict["order_items"]
                 ]
-            
+
             # Validate using Pydantic model
             validated = RestaurantOrderStateModel(**state_dict)
-            
+
             # Convert back to TypedDict format
             return cls(
                 messages=validated.messages,
                 order_id=validated.order_id,
-                order_items=[item.dict() for item in validated.order_items],
+                order_items=[item.model_dump() for item in validated.order_items],
                 order_status=validated.order_status,
                 total_cost=validated.total_cost,
-                payment_status=validated.payment_status
+                payment_status=validated.payment_status,
+                conversation_rounds=validated.conversation_rounds,
+                summary=validated.summary
             )
         except ValidationError as e:
             logger.error(f"State validation error: {str(e)}")
@@ -272,38 +313,46 @@ def get_food_menu() -> str:
     """
 
 @tool
+def get_menu_item_price(item_name: str) -> str:
+    """Call this to get the price of a specific menu item.
+    Returns the price if item exists, or an error message if not found."""
+    if item_name in menu_prices:
+        return f"{item_name} costs ${menu_prices[item_name]:.2f}"
+    return f"Item '{item_name}' not found in menu"
+
+@tool
 def get_restaurant_info() -> str:
     """Call this to get information about the restaurant, including its history, hours, and accolades."""
     return """
     === VILLA TOSCANA ===
-    
+
     🏰 About Us:
-    Established in 1985, Villa Toscana sits in a restored 19th-century mansion in the heart of the city. 
+    Established in 1985, Villa Toscana sits in a restored 19th-century mansion in the heart of the city.
     Our restaurant brings authentic Tuscan flavors with a modern twist to your table.
-    
+
     👨‍🍳 Our Team:
     - Owner: Marco Rossi (3rd generation restaurateur)
     - Executive Chef: Isabella Chen
         - Former sous chef at 3-Michelin-starred Le Bernardin
         - James Beard Rising Star Chef 2022
     - Sommelier: James Thompson (Court of Master Sommeliers certified)
-    
+
     🏆 Awards & Recognition:
     - Michelin Star (2020-2024)
     - Wine Spectator Award of Excellence (2018-2024)
     - Best Italian Restaurant - City Dining Awards 2023
     - "Top 50 Restaurants in America" - Bon Appétit Magazine 2022
-    
+
     ⏰ Hours of Operation:
     - Lunch: Tuesday-Sunday, 11:30 AM - 2:30 PM
     - Dinner: Tuesday-Sunday, 5:30 PM - 10:00 PM
     - Closed on Mondays
-    
+
     🎉 Special Events:
     - Weekly wine tasting events (Thursday evenings)
     - Monthly cooking classes with Chef Isabella
     - Private dining rooms available for special occasions
-    
+
     For reservations: +1 (555) 123-4567
     Address: 123 Olive Garden Street, Metropolis, MB 12345
     """
@@ -327,6 +376,52 @@ def check_and_update_stock(item_name: str, quantity: int) -> str:
                 return f"insufficient_stock in {department}"
     logger.error(f"Item not found in any department: {item_name}")
     return "item_not_found"
+
+def should_summarize(state: RestaurantOrderState) -> bool:
+    logger.info(f"Conversation rounds: {state['conversation_rounds']}")
+    return state["conversation_rounds"] >= 6
+
+
+
+def conversation_summarizer(state: RestaurantOrderState) -> dict:
+    """Generate and store conversation summary"""
+    global system_message
+    logger.info("Generating conversation summary")
+    messages = [msg for msg in state["messages"] if isinstance(msg, (HumanMessage, AIMessage))]
+    logger.info(f"Total messages in conversation_summarizer: {len(messages)}")
+    # Create summary prompt
+    summary_prompt = [
+        SystemMessage(content="Condense this conversation while preserving order details, dietary preferences, and payment status. Keep important customers information and preferences."),
+        HumanMessage(content="\n".join([
+            f"{'User' if isinstance(m, HumanMessage) else 'Waiter'}: {m.content}"
+            for m in messages[-16:]  # Last 8 rounds (2 messages per round)
+        ]))
+    ]
+
+    # Generate summary
+    summary = deepseek_llm.invoke(summary_prompt).content
+    logger.info(f"Generated summary: {summary}")
+    delete_messages = [RemoveMessage(id=m.id) for m in state["messages"][:-6]]
+    logger.info(f"Deleting messages:    {delete_messages}")
+    logger.info(f"length of state messages before deletion: {len(state['messages'])}")
+    logger.info(f"Messages before summarization: {state['messages']}") # Log messages before summarization
+
+    new_messages = [system_message] + messages[-6:] 
+    logger.info(f"Messages after summarization and deletion: {new_messages}") # Log messages after summarization
+
+    # Update state
+    updated_state = {
+        "messages": new_messages,
+        "order_id": state["order_id"],
+        "order_items": state["order_items"],
+        "order_status": state["order_status"],
+        "total_cost": state["total_cost"],
+        "payment_status": state["payment_status"],
+        "conversation_rounds": 0,  # Reset counter
+        "summary": f"Previous Summary: {state['summary']}\nNew Summary: {summary}"
+    }
+    logger.info(f"State before summarizer returns: {updated_state}") 
+    return updated_state
 
 
 @tool
@@ -356,7 +451,7 @@ def cashier_calculate_total(order_id: int) -> float:
     tip_amount = subtotal * 0.15
     total = round(subtotal + tip_amount, 2)
 
-   
+
     logger.info(f"Order {order_id} total calculated: ${total}")
     return total
 
@@ -416,7 +511,7 @@ def create_order(order_items: List[Dict[str, Union[str, int]]]) -> str:
     try:
         # Validate order items using Pydantic
         validated_items = [OrderItem(**item) for item in order_items]
-        
+
         global orders
         logger.info(f"Creating new order with items: {validated_items}")
         order_id = get_new_order_id()
@@ -428,7 +523,7 @@ def create_order(order_items: List[Dict[str, Union[str, int]]]) -> str:
         }
         logger.info(f"Order {order_id} created successfully")
         return f"New order {order_id} created with status 'pending'."
-        
+
     except ValidationError as e:
         logger.error(f"Order validation error: {str(e)}")
         return f"Error creating order: {str(e)}"
@@ -523,14 +618,15 @@ tools = [
     process_order,
     cashier_calculate_total,
     check_payment,
-    get_restaurant_info
+    get_restaurant_info,
+    get_menu_item_price
 ]
 
 tool_node = ToolNode(tools)
-model_with_tools = deepseek_llm.bind_tools(tools)
+model_with_tools = llm.bind_tools(tools)
 
 #custom tools condition, can be modified and used in the workflow with workflow.add_conditional_edges if needed
-def should_continue(state: RestaurantOrderState): # Updated state type
+def should_continue(state: RestaurantOrderState):
     messages = state['messages']
     last_message = messages[-1]
     logger.info(f"Last tool message: {last_message}")
@@ -540,37 +636,68 @@ def should_continue(state: RestaurantOrderState): # Updated state type
     logger.info("Last message is not a tool call")
     return END
 
-def call_model_with_tools(state: RestaurantOrderState): # Updated state type
+def call_model_with_tools(state: RestaurantOrderState):
     messages = state['messages']
     try:
         logger.info(f"LLM input: {messages}")
         response = model_with_tools.invoke(messages)
         logger.info(f"LLM response: {response}")
+
         return {"messages":[response],
-                "order_id": state['order_id'], 
-                "order_items": state['order_items'],
-                "order_status": state['order_status'],
-                "total_cost": state['total_cost'],
-                "payment_status": state['payment_status']}
-    except Exception as e:
-        logger.error(f"LLM invoke error: {str(e)}", exc_info=True)
-        error_message = AIMessage(content="I apologize, but I'm having trouble processing your request. Could you please try again?")
-        return {"messages":[error_message], 
                 "order_id": state['order_id'],
                 "order_items": state['order_items'],
                 "order_status": state['order_status'],
                 "total_cost": state['total_cost'],
-                "payment_status": state['payment_status']}
+                "payment_status": state['payment_status'],
+                "conversation_rounds": state["conversation_rounds"], 
+                "summary": state["summary"]}
+    except Exception as e:
+        logger.error(f"LLM invoke error: {str(e)}", exc_info=True)
+        error_message = AIMessage(content="I apologize, but I'm having trouble processing your request. Could you please try again?")
+        return {"messages":[error_message],
+                "order_id": state['order_id'],
+                "order_items": state['order_items'],
+                "order_status": state['order_status'],
+                "total_cost": state['total_cost'],
+                "payment_status": state['payment_status'],
+                "conversation_rounds": state["conversation_rounds"], 
+                "summary": state["summary"]}
+
+def route_after_agent(state: RestaurantOrderState) -> str:
+    """Decide whether to summarize, use tools, or end conversation"""
+    messages = state['messages']
+    last_message = messages[-1]
+
+    # If last message was a tool call, continue to tools
+    if last_message.tool_calls:
+        return "tools"
+
+    # If last message was user input and we need to summarize
+    if should_summarize(state):
+        return "summarizer"
+
+    # Otherwise end the conversation
+    return END
+
 
 # Build the state graph
 workflow = StateGraph(RestaurantOrderState) # Use custom state schema
 memory=MemorySaver()
 workflow.add_node("agent", call_model_with_tools)
 workflow.add_node("tools", tool_node)
+workflow.add_node("summarizer", conversation_summarizer)
 
+#the add conditional edges also has problem
 workflow.add_edge(START, "agent")
-workflow.add_conditional_edges('agent', tools_condition)
+workflow.add_conditional_edges(
+    "agent",
+    route_after_agent
+)
+
 workflow.add_edge("tools", "agent")
+workflow.add_edge("summarizer", "agent")
+workflow.add_edge("agent", END)
+
 
 app = workflow.compile(checkpointer=memory)
 config = {"configurable": {"thread_id": "1"}}
@@ -579,47 +706,21 @@ config = {"configurable": {"thread_id": "1"}}
 
 def create_initial_state() -> RestaurantOrderState:
     """Create and validate initial state"""
-    system_message = SystemMessage(
-    content=(
-       "You are a waiter at Villa Toscana, an upscale Italian restaurant. You will greet the user and serve them "
-        "with restaurant menus, manage orders, check availability, handle billing and payments, and communicate with "
-        "the virtual restaurant departments to fulfill orders. You can provide information about our restaurant's "
-        "history, team, and accolades when asked. "
-        "You can only call tools to answer the user's query or perform operations. "
-        "Always remain polite, confirm orders, provide recommendations, and handle small talk briefly "
-        "before steering back to restaurant matters. After providing information or fulfilling requests, "
-        "ask the user if they need anything else."
-        "Always use create_order first before processing an order."
-        "You only need to create one order for all items, then process the order."
-        "When the user wants to order items, call create_order with a JSON list of objects. "
-        "For each item, provide {\\\"name\\\": <str>, \\\"quantity\\\": <int>}. For instance: "
-        "create_order({\\\"order_items\\\": ["
-        "{\\\"name\\\": \\\"Bruschetta\\\", \\\"quantity\\\": 2}, "
-        "{\\\"name\\\": \\\"Lobster Tail\\\", \\\"quantity\\\": 1}"
-        "]})."
-        "Payment Protocol: Only initiate billing when the user explicitly: \n"
-        "1. States they're finished (e.g., 'I'm done', 'That's all') \n"
-        "2. Directly requests the bill (e.g., 'Check please', 'Can we pay?') \n"
-        "3. Asks about payment (e.g., 'How much do I owe?') \n"
-        "Never suggest payment first - always wait for customer initiation. "
-        "If order modifications continue after billing request, recalculate totals."
-        "Before create_order, always verify that the customer's requested items exactly match the official menu names "
-        "(use get_food_menu/get_drinks_menu tools to confirm). Convert colloquial terms to standardized menu names "
-        "(e.g., 'steak' → 'Ribeye Steak', 'iced tea' → 'Black Tea'). If ambiguous, politely clarify with the customer. "
-        "Incorrect names will fail inventory checks and delay order processing."
-    )
-)
 
-    
+    global system_message
+
     initial_state = {
         "messages": [system_message],
         "order_id": 0,
         "order_items": [],
         "order_status": "pending",
         "total_cost": 0.0,
-        "payment_status": "pending"
+        "payment_status": "pending",
+        "conversation_rounds": 0,
+        "summary": "No summary yet"
     }
-    
+    logger.info(f"Initial State Messages: {initial_state['messages']}") # Log initial messages
+
     return RestaurantOrderState.validate_state(initial_state)
 
 
@@ -637,7 +738,7 @@ if __name__ == "__main__":
             logger.info(f"AI response: {ai_messages[-1].content}")
         while True:
             user_input = input("\nYou: ")
-            
+
             if user_input.lower() == 'q':
                 logger.info("User ended conversation")
                 print("Thank you for visiting! Goodbye!")
@@ -655,9 +756,11 @@ if __name__ == "__main__":
                     "order_items": current_state[0]['order_items'],
                     "order_status": current_state[0]['order_status'],
                     "total_cost": current_state[0]['total_cost'],
-                    "payment_status": current_state[0]['payment_status']
+                    "payment_status": current_state[0]['payment_status'],
+                    "conversation_rounds": current_state[0]['conversation_rounds']+1,
+                    "summary": current_state[0]['summary']
                 }
-                
+
                 validated_state = RestaurantOrderState.validate_state(updated_state_dict)
                 result = app.invoke(validated_state, config=config)
 
@@ -669,7 +772,7 @@ if __name__ == "__main__":
             except ValidationError as e:
                 logger.error(f"State validation error: {str(e)}")
                 print("\nWaiter: I apologize, but there was an error with your order. Please try again.")
-                
+
     except Exception as e:
         logger.error(f"Critical error: {str(e)}", exc_info=True)
         print("\nWaiter: I apologize, but our system is currently unavailable. Please try again later.")
