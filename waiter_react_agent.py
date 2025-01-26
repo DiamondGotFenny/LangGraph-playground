@@ -24,6 +24,7 @@ from typing import List, Dict, Union, Optional, Literal,TypedDict
 from typing_extensions import Annotated
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage,AnyMessage,RemoveMessage
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph import StateGraph, END, START,add_messages
@@ -207,7 +208,7 @@ class RestaurantOrderStateModel(BaseModel):
 class RestaurantOrderState(TypedDict):
     messages: Annotated[List[AnyMessage], add_messages]
     order_id: Optional[int]
-    order_items: List[Dict[str, Union[str, int]]]
+    order_items: List[OrderItem]
     order_status: str
     total_cost: float
     payment_status: str
@@ -498,7 +499,7 @@ def check_payment(amount: float, method: str, order_id: int ) -> str:
 
 
 @tool
-def create_order(order_items: List[Dict[str, Union[str, int]]]) -> str:
+def create_order(order_items: OrderItem) -> str:
     """
     Creates a new order with status 'pending', given a list of order items in JSON format,
     for example:
@@ -610,6 +611,10 @@ deepseek_llm=ChatOpenAI(
     max_tokens=4096
 )
 
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL_FLASH20= os.getenv("GEMINI_MODEL_FLASH20")
+gemini_llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL_FLASH20, api_key=GEMINI_API_KEY, temperature=0.5, max_tokens=4096,timeout=60,transport="rest")
+
 # Add our expanded tools
 tools = [
     get_drinks_menu,
@@ -623,7 +628,7 @@ tools = [
 ]
 
 tool_node = ToolNode(tools)
-model_with_tools = llm.bind_tools(tools)
+model_with_tools = gemini_llm.bind_tools(tools)
 
 #custom tools condition, can be modified and used in the workflow with workflow.add_conditional_edges if needed
 def should_continue(state: RestaurantOrderState):
@@ -698,7 +703,6 @@ workflow.add_edge("tools", "agent")
 workflow.add_edge("summarizer", "agent")
 workflow.add_edge("agent", END)
 
-
 app = workflow.compile(checkpointer=memory)
 config = {"configurable": {"thread_id": "1"}}
 
@@ -710,7 +714,7 @@ def create_initial_state() -> RestaurantOrderState:
     global system_message
 
     initial_state = {
-        "messages": [system_message],
+        "messages": [system_message]+[HumanMessage(content=" ")],
         "order_id": 0,
         "order_items": [],
         "order_status": "pending",
