@@ -406,7 +406,8 @@ def conversation_summarizer(state: RestaurantOrderState) -> RestaurantOrderState
     summary = gemini_llm.invoke(summary_prompt).content
     logger.info(f"Generated summary: {summary}")
 
-    delete_messages = [RemoveMessage(id=m.id) for m in state["messages"][:-4]]
+    #delete previous messages except system message and last 4 messages, and the last 4 messages should be human messages and ai messages
+    delete_messages = [msg for msg in state["messages"] if not isinstance(msg, SystemMessage) and not isinstance(msg, HumanMessage) and not isinstance(msg, AIMessage)]
     # Keep only the system message and last few messages
     logger.info(f"delete message: {delete_messages}")
     logger.info(f"length of state messages before deletion: {len(state['messages'])}")
@@ -680,6 +681,8 @@ def call_model_with_tools(state: RestaurantOrderState) -> RestaurantOrderState: 
             messages = [system_messages[0], summary_message] + other_messages
         else:
             messages = filtered_messages
+        app.update_state(values={"messages": messages}, config=config)
+        logger.info(f"---------------Updated state after summarizer in should_summarize call_model_with_tools: {state}---------------------") 
 
 
     try:
