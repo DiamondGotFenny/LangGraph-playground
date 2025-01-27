@@ -23,7 +23,7 @@ from typing_extensions import Annotated
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import AIMessage, SystemMessage, HumanMessage,AnyMessage,RemoveMessage
+from langchain_core.messages import AIMessage, SystemMessage, HumanMessage,AnyMessage,trim_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph import StateGraph, END, START,add_messages
 from logger_config import setup_logger
@@ -424,7 +424,7 @@ def conversation_summarizer(state: RestaurantOrderState) -> RestaurantOrderState
         "order_status": state["order_status"],
         "total_cost": state["total_cost"],
         "payment_status": state["payment_status"],
-        "conversation_rounds": 1,  # Reset counter
+        "conversation_rounds": 0,  # Reset counter
         "summary": f"Previous Summary: {state['summary']}\nNew Summary: {summary}"
     }
     updated_state = RestaurantOrderState.validate_state(updated_state_dict) # Validate and create RestaurantOrderState
@@ -653,8 +653,8 @@ def should_continue(state: RestaurantOrderState) -> Literal["tools", "__end__"]:
 def call_model_with_tools(state: RestaurantOrderState) -> RestaurantOrderState: # Node function now works with OverallState
     messages = state['messages']
     logger.info(f"state in call model: {state}")
-
-    if should_summarize(state):
+    summary = state.get('summary', '')
+    if state["conversation_rounds"] >= 6:
         state = conversation_summarizer(state) # Summarize before LLM call
         messages = state['messages'] # Get updated messages
         # Filter out empty AIMessages with tool calls
@@ -669,7 +669,7 @@ def call_model_with_tools(state: RestaurantOrderState) -> RestaurantOrderState: 
 
         # Ensure the system message is first, then summary (if exists), then other messages
         system_messages = [msg for msg in filtered_messages if isinstance(msg, SystemMessage)]
-        summary = state.get('summary', '')
+        
         other_messages = [
             msg for msg in filtered_messages 
             if not isinstance(msg, SystemMessage)
@@ -686,6 +686,12 @@ def call_model_with_tools(state: RestaurantOrderState) -> RestaurantOrderState: 
 
 
     try:
+        if isinstance(messages[-1], HumanMessage):
+            system_messages = [msg for msg in messages if isinstance(msg, SystemMessage)]
+            if summary and state["summary"]:
+            # Add summary as AIMessage after system message
+                summary_message = AIMessage(content=f"Conversation Summary:\n{state['summary']}")
+                messages = [system_messages[0], summary_message] + messages[-4:]
         
         logger.info(f"LLM input: {messages}")
         response = model_with_tools.invoke(messages)
