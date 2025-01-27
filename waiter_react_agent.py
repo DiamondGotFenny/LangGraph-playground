@@ -593,7 +593,7 @@ def process_order(order_id: int) -> str:
 # Initialize the AzureChatOpenAI LLM
 AZURE_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_4O = os.getenv("AZURE_OPENAI_MODEL_4o")
+AZURE_OPENAI_4O = os.getenv("OPENAI_MODEL_4o")
 AZURE_API_VERSION = os.getenv("AZURE_API_VERSION")
 
 AZURE_OPENAI_4OMINI= os.getenv("OPENAI_MODEL_4OMINI")
