@@ -1,8 +1,6 @@
-####################
 """
-waiter_react_agent.py
-
 This script demonstrates an LLM-powered restaurant waiter with a custom LangGraph state schema for order tracking:
+(Refactored version with explicit input and output schemas for StateGraph)
 1. Polite conversation and menu Q&A.
 2. Order creation with unique order ID and status tracking using custom state.
 3. Communication with multiple departments for stock checks and order fulfillment.
@@ -205,7 +203,7 @@ class RestaurantOrderStateModel(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
-class RestaurantOrderState(TypedDict):
+class RestaurantOrderState(TypedDict): # Overall State, internal schema
     messages: Annotated[List[AnyMessage], add_messages]
     order_id: Optional[int]
     order_items: List[OrderItem]
@@ -244,6 +242,12 @@ class RestaurantOrderState(TypedDict):
             logger.error(f"State validation error: {str(e)}")
             raise
 
+class InputState(TypedDict): # Input Schema
+    messages: List[AnyMessage] # User input messages
+    conversation_rounds: int = Field(default=0, description="Number of conversation exchanges")
+
+class OutputState(TypedDict): # Output Schema
+    messages: List[AIMessage] # Agent output messages
 
 
 # -------------------------- Tools Section -------------------------- #
@@ -383,8 +387,7 @@ def should_summarize(state: RestaurantOrderState) -> bool:
     return state["conversation_rounds"] >= 6
 
 
-
-def conversation_summarizer(state: RestaurantOrderState) -> dict:
+def conversation_summarizer(state: RestaurantOrderState) -> RestaurantOrderState: # Node function now works with OverallState
     """Generate and store conversation summary"""
     global system_message
     logger.info("Generating conversation summary")
@@ -392,36 +395,40 @@ def conversation_summarizer(state: RestaurantOrderState) -> dict:
     logger.info(f"Total messages in conversation_summarizer: {len(messages)}")
     # Create summary prompt
     summary_prompt = [
-        SystemMessage(content="Condense this conversation while preserving order details, dietary preferences, and payment status. Keep important customers information and preferences."),
+        SystemMessage(content="Summarize the conversation provided below. Focus on extracting and preserving key details such as order items, quantities, dietary preferences, and payment status if mentioned.  Crucially, **only summarize information that is explicitly stated in the conversation**. Do not invent, infer, or hallucinate any details that are not directly mentioned. Keep track of important customer information and preferences that are explicitly stated."),
         HumanMessage(content="\n".join([
             f"{'User' if isinstance(m, HumanMessage) else 'Waiter'}: {m.content}"
-            for m in messages[-16:]  # Last 8 rounds (2 messages per round)
+            for m in messages[:12]  # first 8 messages
         ]))
     ]
 
     # Generate summary
-    summary = deepseek_llm.invoke(summary_prompt).content
+    summary = gemini_llm.invoke(summary_prompt).content
     logger.info(f"Generated summary: {summary}")
-    delete_messages = [RemoveMessage(id=m.id) for m in state["messages"][:-6]]
-    logger.info(f"Deleting messages:    {delete_messages}")
+
+    delete_messages = [RemoveMessage(id=m.id) for m in state["messages"][:-4]]
+    # Keep only the system message and last few messages
+    logger.info(f"delete message: {delete_messages}")
     logger.info(f"length of state messages before deletion: {len(state['messages'])}")
     logger.info(f"Messages before summarization: {state['messages']}") # Log messages before summarization
-
-    new_messages = [system_message] + messages[-6:] 
+    # Keep only the system message and last few messages
+    new_messages = [system_message] + messages[-4:]
     logger.info(f"Messages after summarization and deletion: {new_messages}") # Log messages after summarization
 
     # Update state
-    updated_state = {
+    updated_state_dict = { # Create a dict first then validate
         "messages": new_messages,
         "order_id": state["order_id"],
         "order_items": state["order_items"],
         "order_status": state["order_status"],
         "total_cost": state["total_cost"],
         "payment_status": state["payment_status"],
-        "conversation_rounds": 0,  # Reset counter
+        "conversation_rounds": 1,  # Reset counter
         "summary": f"Previous Summary: {state['summary']}\nNew Summary: {summary}"
     }
-    logger.info(f"State before summarizer returns: {updated_state}") 
+    updated_state = RestaurantOrderState.validate_state(updated_state_dict) # Validate and create RestaurantOrderState
+    logger.info(f"current state: {state}")
+    logger.info(f"State before summarizer returns: {updated_state}")
     return updated_state
 
 
@@ -585,7 +592,7 @@ def process_order(order_id: int) -> str:
 # Initialize the AzureChatOpenAI LLM
 AZURE_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_4O = os.getenv("OPENAI_MODEL_4o")
+AZURE_OPENAI_4O = os.getenv("AZURE_OPENAI_MODEL_4o")
 AZURE_API_VERSION = os.getenv("AZURE_API_VERSION")
 
 AZURE_OPENAI_4OMINI= os.getenv("OPENAI_MODEL_4OMINI")
@@ -624,14 +631,15 @@ tools = [
     cashier_calculate_total,
     check_payment,
     get_restaurant_info,
-    get_menu_item_price
+    get_menu_item_price,
+    # conversation_summarizer, # Removed summarizer from tools
 ]
 
 tool_node = ToolNode(tools)
 model_with_tools = gemini_llm.bind_tools(tools)
 
 #custom tools condition, can be modified and used in the workflow with workflow.add_conditional_edges if needed
-def should_continue(state: RestaurantOrderState):
+def should_continue(state: RestaurantOrderState) -> Literal["tools", "__end__"]: # Output type is now Literal
     messages = state['messages']
     last_message = messages[-1]
     logger.info(f"Last tool message: {last_message}")
@@ -641,66 +649,91 @@ def should_continue(state: RestaurantOrderState):
     logger.info("Last message is not a tool call")
     return END
 
-def call_model_with_tools(state: RestaurantOrderState):
+def call_model_with_tools(state: RestaurantOrderState) -> RestaurantOrderState: # Node function now works with OverallState
     messages = state['messages']
+    logger.info(f"state in call model: {state}")
+
+    if should_summarize(state):
+        state = conversation_summarizer(state) # Summarize before LLM call
+        messages = state['messages'] # Get updated messages
+        # Filter out empty AIMessages with tool calls
+        filtered_messages = [
+            msg for msg in messages 
+            if not (
+                isinstance(msg, AIMessage) and 
+                msg.content == '' and 
+                (msg.additional_kwargs.get('function_call') or msg.tool_calls)
+            )
+        ]
+
+        # Ensure the system message is first, then summary (if exists), then other messages
+        system_messages = [msg for msg in filtered_messages if isinstance(msg, SystemMessage)]
+        summary = state.get('summary', '')
+        other_messages = [
+            msg for msg in filtered_messages 
+            if not isinstance(msg, SystemMessage)
+        ]
+
+        if summary and system_messages:
+            # Add summary as AIMessage after system message
+            summary_message = AIMessage(content=f"Conversation Summary:\n{summary}")
+            messages = [system_messages[0], summary_message] + other_messages
+        else:
+            messages = filtered_messages
+
+
     try:
+        
         logger.info(f"LLM input: {messages}")
         response = model_with_tools.invoke(messages)
         logger.info(f"LLM response: {response}")
 
-        return {"messages":[response],
-                "order_id": state['order_id'],
-                "order_items": state['order_items'],
-                "order_status": state['order_status'],
-                "total_cost": state['total_cost'],
-                "payment_status": state['payment_status'],
-                "conversation_rounds": state["conversation_rounds"], 
-                "summary": state["summary"]}
+        updated_state_dict = { # Create a dict first then validate
+                "messages":[response],
+                "order_id": state.get('order_id', 0),
+                "order_items":state.get('order_items', []),
+                "order_status": state.get('order_status', 'pending'),
+                "total_cost": state.get('total_cost', 0.0),
+                "payment_status": state.get('payment_status', 'pending'),
+                "conversation_rounds": state.get('conversation_rounds', state.get('conversation_rounds',0)), # Keep rounds if not summarized, otherwise already reset in summarizer
+                "summary": state.get('summary', '')
+        }
+        updated_state = RestaurantOrderState.validate_state(updated_state_dict) # Validate and create RestaurantOrderState
+        logger.info(f"Updated state: {updated_state}")
+        return updated_state # directly return the validated state object
     except Exception as e:
         logger.error(f"LLM invoke error: {str(e)}", exc_info=True)
         error_message = AIMessage(content="I apologize, but I'm having trouble processing your request. Could you please try again?")
-        return {"messages":[error_message],
-                "order_id": state['order_id'],
-                "order_items": state['order_items'],
-                "order_status": state['order_status'],
-                "total_cost": state['total_cost'],
-                "payment_status": state['payment_status'],
-                "conversation_rounds": state["conversation_rounds"], 
-                "summary": state["summary"]}
-
-def route_after_agent(state: RestaurantOrderState) -> str:
-    """Decide whether to summarize, use tools, or end conversation"""
-    messages = state['messages']
-    last_message = messages[-1]
-
-    # If last message was a tool call, continue to tools
-    if last_message.tool_calls:
-        return "tools"
-
-    # If last message was user input and we need to summarize
-    if should_summarize(state):
-        return "summarizer"
-
-    # Otherwise end the conversation
-    return END
+        updated_state_dict = { # Create a dict first then validate
+               "messages":[error_message],
+                "order_id": state.get('order_id', 0),
+                "order_items":state.get('order_items', []),
+                "order_status": state.get('order_status', 'pending'),
+                "total_cost": state.get('total_cost', 0.0),
+                "payment_status": state.get('payment_status', 'pending'),
+                "conversation_rounds": state.get('conversation_rounds', state.get('conversation_rounds',0)), # Keep rounds if not summarized
+                "summary": state.get('summary', '')
+        }
+        updated_state = RestaurantOrderState.validate_state(updated_state_dict) # Validate and create RestaurantOrderState
+        return updated_state # directly return the validated state object
 
 
 # Build the state graph
-workflow = StateGraph(RestaurantOrderState) # Use custom state schema
+workflow = StateGraph(RestaurantOrderState, input=InputState, output=OutputState) # Use custom state schema with input/output types
 memory=MemorySaver()
 workflow.add_node("agent", call_model_with_tools)
 workflow.add_node("tools", tool_node)
-workflow.add_node("summarizer", conversation_summarizer)
+# workflow.add_node("summarizer", conversation_summarizer) # Removed summarizer node
 
 #the add conditional edges also has problem
 workflow.add_edge(START, "agent")
 workflow.add_conditional_edges(
     "agent",
-    route_after_agent
+   tools_condition
 )
 
 workflow.add_edge("tools", "agent")
-workflow.add_edge("summarizer", "agent")
+# workflow.add_edge("summarizer", "agent") # Removed summarizer edge
 workflow.add_edge("agent", END)
 
 app = workflow.compile(checkpointer=memory)
@@ -708,13 +741,13 @@ config = {"configurable": {"thread_id": "1"}}
 
 # Initial system message
 
-def create_initial_state() -> RestaurantOrderState:
-    """Create and validate initial state"""
+if __name__ == "__main__":
+    logger.info("Starting restaurant waiter service with custom state")
+    print("Welcome to the restaurant! Type 'q' to quit the conversation.")
 
-    global system_message
-
-    initial_state = {
-        "messages": [system_message]+[HumanMessage(content=" ")],
+    try:
+        app.update_state(values={ # Create a dict first then validate
+        "messages": [system_message],
         "order_id": 0,
         "order_items": [],
         "order_status": "pending",
@@ -722,24 +755,7 @@ def create_initial_state() -> RestaurantOrderState:
         "payment_status": "pending",
         "conversation_rounds": 0,
         "summary": "No summary yet"
-    }
-    logger.info(f"Initial State Messages: {initial_state['messages']}") # Log initial messages
-
-    return RestaurantOrderState.validate_state(initial_state)
-
-
-if __name__ == "__main__":
-    logger.info("Starting restaurant waiter service with custom state")
-    print("Welcome to the restaurant! Type 'q' to quit the conversation.")
-
-    try:
-        # Initialize state with validation
-        initial_state = create_initial_state()
-        result=app.invoke(initial_state, config=config)
-        ai_messages = [msg for msg in result['messages'] if isinstance(msg, AIMessage)]
-        if ai_messages:
-            print("\nWaiter:", ai_messages[-1].content)
-            logger.info(f"AI response: {ai_messages[-1].content}")
+    },config=config)
         while True:
             user_input = input("\nYou: ")
 
@@ -750,23 +766,17 @@ if __name__ == "__main__":
 
             logger.info(f"User input: {user_input}")
             user_message = HumanMessage(content=user_input, name="user")
+            current_state = app.get_state(config)
+            update_convervation_rounds = app.update_state(values={"conversation_rounds":current_state[0]['conversation_rounds']+1},config=config)
 
             try:
                 # Update state with validation
-                current_state = app.get_state(config)
                 updated_state_dict = {
-                    "messages": list(current_state[0]['messages']) + [user_message],
-                    "order_id": current_state[0]['order_id'],
-                    "order_items": current_state[0]['order_items'],
-                    "order_status": current_state[0]['order_status'],
-                    "total_cost": current_state[0]['total_cost'],
-                    "payment_status": current_state[0]['payment_status'],
-                    "conversation_rounds": current_state[0]['conversation_rounds']+1,
-                    "summary": current_state[0]['summary']
+                    "messages": list(current_state[0]['messages']) + [user_message]
                 }
 
                 validated_state = RestaurantOrderState.validate_state(updated_state_dict)
-                result = app.invoke(validated_state, config=config)
+                result = app.invoke(updated_state_dict, config=config)
 
                 ai_messages = [msg for msg in result['messages'] if isinstance(msg, AIMessage)]
                 if ai_messages:
