@@ -106,11 +106,8 @@ system_message = SystemMessage(
         "Always use create_order first before processing an order."
         "You only need to create one order for all items, then process the order."
         "When the user wants to order items, call create_order with a JSON list of objects. "
-        "For each item, provide {\\\"name\\\": <str>, \\\"quantity\\\": <int>}. For instance: "
-        "create_order({\\\"order_items\\\": ["
-        "{\\\"name\\\": \\\"Bruschetta\\\", \\\"quantity\\\": 2}, "
-        "{\\\"name\\\": \\\"Lobster Tail\\\", \\\"quantity\\\": 1}"
-        "]})."
+        "For each item, provide {\"name\": <str>, \"quantity\": <int>}. For instance: "
+        "create_order({\"order_items\": [{\"name\": \"Bruschetta\", \"quantity\": 2}, {\"name\": \"Lobster Tail\", \"quantity\": 1}]})."
         "Payment Protocol: Only initiate billing when the user explicitly: \n"
         "1. States they're finished (e.g., 'I'm done', 'That's all') \n"
         "2. Directly requests the bill (e.g., 'Check please', 'Can we pay?') \n"
@@ -126,6 +123,7 @@ system_message = SystemMessage(
         "use the get_menu_item_price tool to provide accurate pricing information. "
         "Always verify the exact menu name before checking prices."
         "To use 'get_food_menu' and 'get_drinks_menu' only when the user explicitly asks for the menu(e.g., \"show me the menu,\" \"can I see the menu?\") or verify the exact menu item name, if there is no full menu in the conversation history."
+        "do not return empty in any condition, always return a message to the user."
     )
 )
 
@@ -507,7 +505,7 @@ def check_payment(amount: float, method: str, order_id: int ) -> str:
 
 
 @tool
-def create_order(order_items: OrderItem) -> str:
+def create_order(order_items: List[OrderItem]) -> str:
     """
     Creates a new order with status 'pending', given a list of order items in JSON format,
     for example:
@@ -519,14 +517,14 @@ def create_order(order_items: OrderItem) -> str:
     """
     try:
         # Validate order items using Pydantic
-        validated_items = [OrderItem(**item) for item in order_items]
-
+        
+    
         global orders
-        logger.info(f"Creating new order with items: {validated_items}")
+        logger.info(f"Creating new order with items: {order_items}")
         order_id = get_new_order_id()
 
         orders[order_id] = {
-            "items": [item.model_dump() for item in validated_items],
+            "items": [item.model_dump() for item in order_items],
             "status": "pending",
             "total_cost": 0.0,
         }
@@ -621,7 +619,8 @@ deepseek_llm=ChatOpenAI(
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL_FLASH20= os.getenv("GEMINI_MODEL_FLASH20")
-gemini_llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL_FLASH20, api_key=GEMINI_API_KEY, temperature=0.5, max_tokens=4096,timeout=60,transport="rest")
+GEMINI_MODEL_FLASH15= os.getenv("GEMINI_MODEL_FLASH15")
+gemini_llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL_FLASH15, api_key=GEMINI_API_KEY, temperature=0.5, max_tokens=4096,timeout=60,transport="rest")
 
 # Add our expanded tools
 tools = [
@@ -640,6 +639,7 @@ tool_node = ToolNode(tools)
 model_with_tools = gemini_llm.bind_tools(tools)
 
 #custom tools condition, can be modified and used in the workflow with workflow.add_conditional_edges if needed
+
 def should_continue(state: RestaurantOrderState) -> Literal["tools", "__end__"]: # Output type is now Literal
     messages = state['messages']
     last_message = messages[-1]
