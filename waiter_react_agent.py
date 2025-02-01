@@ -413,7 +413,9 @@ def conversation_summarizer(state: RestaurantOrderState) -> RestaurantOrderState
     # Keep only the system message and last few messages
     new_messages = [system_message] + messages[-4:]
     logger.info(f"Messages after summarization and deletion: {new_messages}") # Log messages after summarization
-
+    #if there is already a summary, append the new summary to the existing summary
+    if state['summary']:
+        summary = f"{state['summary']}\n{summary}"
     # Update state
     updated_state_dict = { # Create a dict first then validate
         "messages": new_messages,
@@ -423,7 +425,7 @@ def conversation_summarizer(state: RestaurantOrderState) -> RestaurantOrderState
         "total_cost": state["total_cost"],
         "payment_status": state["payment_status"],
         "conversation_rounds": 0,  # Reset counter
-        "summary": f"Previous Summary: {state['summary']}\nNew Summary: {summary}"
+        "summary": summary
     }
     updated_state = RestaurantOrderState.validate_state(updated_state_dict) # Validate and create RestaurantOrderState
     logger.info(f"current state: {state}")
@@ -592,6 +594,7 @@ def process_order(order_id: int) -> str:
 AZURE_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_4O = os.getenv("OPENAI_MODEL_4o")
+OPENAI_MODEL_O1MINI = os.getenv("OPENAI_MODEL_O1MINI")
 AZURE_API_VERSION = os.getenv("AZURE_API_VERSION")
 
 AZURE_OPENAI_4OMINI= os.getenv("OPENAI_MODEL_4OMINI")
@@ -636,7 +639,7 @@ tools = [
 ]
 
 tool_node = ToolNode(tools)
-model_with_tools = gemini_llm.bind_tools(tools)
+model_with_tools =  gemini_llm.bind_tools(tools)
 
 #custom tools condition, can be modified and used in the workflow with workflow.add_conditional_edges if needed
 
@@ -654,6 +657,7 @@ def call_model_with_tools(state: RestaurantOrderState) -> RestaurantOrderState: 
     messages = state['messages']
     logger.info(f"state in call model: {state}")
     summary = state.get('summary', '')
+    global system_message
     if state["conversation_rounds"] >= 6:
         state = conversation_summarizer(state) # Summarize before LLM call
         messages = state['messages'] # Get updated messages
@@ -666,19 +670,16 @@ def call_model_with_tools(state: RestaurantOrderState) -> RestaurantOrderState: 
                 (msg.additional_kwargs.get('function_call') or msg.tool_calls)
             )
         ]
-
-        # Ensure the system message is first, then summary (if exists), then other messages
-        system_messages = [msg for msg in filtered_messages if isinstance(msg, SystemMessage)]
         
         other_messages = [
             msg for msg in filtered_messages 
             if not isinstance(msg, SystemMessage)
         ]
 
-        if summary and system_messages:
+        if summary :
             # Add summary as AIMessage after system message
             summary_message = AIMessage(content=f"Conversation Summary:\n{summary}")
-            messages = [system_messages[0], summary_message] + other_messages
+            messages = [system_message, summary_message] + other_messages
         else:
             messages = filtered_messages
         app.update_state(values={"messages": messages}, config=config)
@@ -687,13 +688,14 @@ def call_model_with_tools(state: RestaurantOrderState) -> RestaurantOrderState: 
 
     try:
         if isinstance(messages[-1], HumanMessage):
-            system_messages = [msg for msg in messages if isinstance(msg, SystemMessage)]
-            if summary and state["summary"]:
+            if summary:
             # Add summary as AIMessage after system message
                 summary_message = AIMessage(content=f"Conversation Summary:\n{state['summary']}")
-                messages = [system_messages[0], summary_message] + messages[-4:]
+                messages = [system_message, summary_message] + messages[-4:]
         
         logger.info(f"LLM input: {messages}")
+        #filter any AI message and the additional_kwargs is not 'function_call' that the content is empty
+        messages=  [msg for msg in messages if not (isinstance(msg, AIMessage) and msg.content == '' and not msg.additional_kwargs.get('function_call'))]
         response = model_with_tools.invoke(messages)
         logger.info(f"LLM response: {response}")
 
@@ -763,7 +765,7 @@ if __name__ == "__main__":
         "total_cost": 0.0,
         "payment_status": "pending",
         "conversation_rounds": 0,
-        "summary": "No summary yet"
+        "summary": ""
     },config=config)
         while True:
             user_input = input("\nYou: ")
