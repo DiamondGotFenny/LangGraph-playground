@@ -12,36 +12,42 @@ Requirements:
 - The "langchain_core" and "langgraph" modules in your environment,
   or adapt the code to your own tool/chain management libraries.
 """
+
 import os
 import random
-import uuid
 from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
 from pydantic import BaseModel, Field, field_validator, ValidationError
-from typing import List, Dict, Union, Optional, Literal, TypedDict
+from typing import List, Dict, Union, Optional, Literal,TypedDict
 from typing_extensions import Annotated
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import AIMessage, SystemMessage, HumanMessage, AnyMessage, trim_messages
+from langchain_core.messages import AIMessage, SystemMessage, HumanMessage,AnyMessage,trim_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.graph import StateGraph, END, START, add_messages
+from langgraph.graph import StateGraph, END, START,add_messages
 from logger_config import setup_logger
 from langgraph.checkpoint.memory import MemorySaver
 
 _ = load_dotenv(find_dotenv())
 
+
 def ensure_log_file(log_file_path: str) -> str:
     """Ensure log file exists, create if it doesn't, and return the path."""
     log_path = Path(log_file_path)
     try:
+        # Create parent directories if needed
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Create file if it doesn't exist
         log_path.touch(exist_ok=True)
         return str(log_path)
     except Exception as e:
         print(f"Warning: Could not create/access log file: {e}")
         return "waiter_react_agent.log"  # Fallback to current directory
 
+_ = load_dotenv(find_dotenv())
+
+# Setup logger with guaranteed log file
 log_file_path = ensure_log_file("waiter_react_agent.log")
 logger = setup_logger(log_file_path)
 
@@ -60,7 +66,7 @@ menu_prices = {
     "Green Tea": 3.50, "Black Tea": 3.50,
 }
 
-# Initial department inventories 
+# Initial department inventories
 initial_stocks = {
     "Appetizer Station": {"Bruschetta": 10, "Caprese Salad": 15, "Shrimp Cocktail": 20},
     "Entrée Station": {"Salmon Fillet": 15, "Chicken Breast": 20, "Vegetable Stir-Fry": 10},
@@ -73,77 +79,68 @@ initial_stocks = {
     "Bar": {"Red Wine": 30, "White Wine": 30, "Cocktail": 25, "Beer": 40},
     "Coffee/Tea Bar": {"Espresso": 50, "Cappuccino": 40, "Latte": 45, "Green Tea": 30, "Black Tea": 35},
 }
-# Global inventory
+
+# Global data structures
 DEPARTMENT_STOCKS = {dept: dict(items) for dept, items in initial_stocks.items()}
 
-# -------------------------- Helper Functions -------------------------- #
-def get_new_order_id() -> str:
-    """Generate a new unique order id using UUID."""
-    return str(uuid.uuid4())
+# Example: store orders in a global dictionary
+# orders[order_id] = {
+#    "items": [{"name": <str>, "quantity": <int>, "department": <str>, "status": <str>}],
+#    "status": "pending" | "partially_fulfilled" | "fulfilled" | "billed" | "paid",
+#    "total_cost": 0,
+#    "paid_amount": 0,
+#    ...
+# }
+orders = {}
+order_counter = 0
+system_message = SystemMessage(
+    content=(
+       "You are a waiter at Villa Toscana, an upscale Italian restaurant. You will greet the user and serve them "
+        "with restaurant menus, manage orders, check availability, handle billing and payments, and communicate with "
+        "the virtual restaurant departments to fulfill orders. You can provide information about our restaurant's "
+        "history, team, and accolades when asked. "
+        "You can only call tools to answer the user's query or perform operations. "
+        "Always remain polite, confirm orders, provide recommendations, and handle small talk briefly "
+        "before steering back to restaurant matters. After providing information or fulfilling requests, "
+        "ask the user if they need anything else."
+        "Always use create_order first before processing an order."
+        "You only need to create one order for all items, then process the order."
+        "When the user wants to order items, call create_order with a JSON list of objects. "
+        "For each item, provide {\"name\": <str>, \"quantity\": <int>}. For instance: "
+        "create_order({\"order_items\": [{\"name\": \"Bruschetta\", \"quantity\": 2}, {\"name\": \"Lobster Tail\", \"quantity\": 1}]})."
+        "Payment Protocol: Only initiate billing when the user explicitly: \n"
+        "1. States they're finished (e.g., 'I'm done', 'That's all') \n"
+        "2. Directly requests the bill (e.g., 'Check please', 'Can we pay?') \n"
+        "3. Asks about payment (e.g., 'How much do I owe?') \n"
+        "Never suggest payment first - always wait for customer initiation. "
+        "If order modifications continue after billing request, recalculate totals."
+        "Before create_order, always verify that the customer's requested items exactly match the official menu names "
+        " Convert colloquial terms to standardized menu names "
+        "(e.g., 'steak' → 'Ribeye Steak', 'iced tea' → 'Black Tea'). If ambiguous, politely clarify with the customer. "
+        "Incorrect names will fail inventory checks and delay order processing."
+        "To not call these tools unnecessarily in other situations."
+        "When the user asks about the price of a specific item, "
+        "use the get_menu_item_price tool to provide accurate pricing information. "
+        "Always verify the exact menu name before checking prices."
+        "To use 'get_food_menu' and 'get_drinks_menu' only when the user explicitly asks for the menu(e.g., \"show me the menu,\" \"can I see the menu?\") or verify the exact menu item name, if there is no full menu in the conversation history."
+        "do not return empty in any condition, always return a message to the user."
+    )
+)
 
-def check_and_update_stock(item_name: str, quantity: int) -> str:
+def get_new_order_id() -> int:
     """
-    Check if the specified item is in stock in the relevant department.
-    If in stock, decrement the inventory and return 'fulfilled'.
-    If not enough stock, return 'insufficient_stock'.
-    If item not found, return 'item_not_found'.
+    Returns a new unique order ID.
     """
-    logger.info(f"Checking stock for item: {item_name}, quantity: {quantity}")
-    for department, items in DEPARTMENT_STOCKS.items():
-        if item_name in items:
-            if items[item_name] >= quantity:
-                items[item_name] -= quantity
-                logger.info(f"Stock fulfilled: {item_name} - {quantity} from {department}")
-                return f"fulfilled in {department}"
-            else:
-                logger.warning(f"Insufficient stock for {item_name} in {department}")
-                return f"insufficient_stock in {department}"
-    logger.error(f"Item not found in any department: {item_name}")
-    return "item_not_found"
+    global order_counter
+    order_counter += 1
+    return order_counter
 
-def should_summarize(state: "RestaurantOrderState") -> bool:
-    logger.info(f"Conversation rounds: {state['conversation_rounds']}")
-    return state["conversation_rounds"] >= 6
 
-def conversation_summarizer(state: "RestaurantOrderState") -> "RestaurantOrderState":
-    """Generate and store conversation summary, then update the state."""
-    global system_message
-    logger.info("Generating conversation summary")
-    messages = [msg for msg in state["messages"] if isinstance(msg, (HumanMessage, AIMessage))]
-    logger.info(f"Total messages in conversation_summarizer: {len(messages)}")
-    summary_prompt = [
-        SystemMessage(content="Summarize the conversation provided below. Focus on extracting key details such as ordered items, quantities, and payment status. Only summarize information explicitly stated."),
-        HumanMessage(content="\n".join([
-            f"{'User' if isinstance(m, HumanMessage) else 'Waiter'}: {m.content}"
-            for m in messages[:12]
-        ]))
-    ]
-
-    summary = gemini_llm.invoke(summary_prompt).content
-    logger.info(f"Generated summary: {summary}")
-    # Remove non-user/non-ai messages except the system message and keep last 4 messages
-    new_messages = [system_message] + messages[-4:]
-    if state['summary']:
-        summary = f"{state['summary']}\n{summary}"
-    updated_state_dict = {
-        "messages": new_messages,
-        "order_id": state["order_id"],
-        "order_items": state["order_items"],
-        "order_status": state["order_status"],
-        "total_cost": state["total_cost"],
-        "payment_status": state["payment_status"],
-        "conversation_rounds": 0,  # Reset counter
-        "summary": summary
-    }
-    updated_state = RestaurantOrderState.validate_state(updated_state_dict)
-    logger.info(f"State before summarizer returns: {updated_state}")
-    return updated_state
-
-# -------------------------- Pydantic Models for State -------------------------- #
+# -------------------------- LangGraph State Definition -------------------------- #
 class OrderItem(BaseModel):
-    """Represents a single item in an order."""
+    """Represents a single item in an order"""
     name: str
-    quantity: int = Field(gt=0)
+    quantity: int = Field(gt=0)  # Ensure quantity is greater than 0
     department: str = ""
     status: Literal["pending", "fulfilled"] = "pending"
 
@@ -162,9 +159,9 @@ class OrderItem(BaseModel):
         return value
 
 class RestaurantOrderStateModel(BaseModel):
-    """Pydantic model for restaurant order state."""
+    """Pydantic model for restaurant order state"""
     messages: Annotated[List[AnyMessage], add_messages]
-    order_id: Optional[str] = Field(default="", description="Unique identifier for the order")
+    order_id: Optional[int] = Field(default=0, description="Unique identifier for the order")
     order_items: List[OrderItem] = Field(default_factory=list, description="List of items in the order")
     order_status: Literal["pending", "processing", "fulfilled", "billed", "paid", "partially_fulfilled"] = Field(
         default="pending",
@@ -204,9 +201,9 @@ class RestaurantOrderStateModel(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
-class RestaurantOrderState(TypedDict):
+class RestaurantOrderState(TypedDict): # Overall State, internal schema
     messages: Annotated[List[AnyMessage], add_messages]
-    order_id: Optional[str]
+    order_id: Optional[int]
     order_items: List[OrderItem]
     order_status: str
     total_cost: float
@@ -216,13 +213,19 @@ class RestaurantOrderState(TypedDict):
 
     @classmethod
     def validate_state(cls, state_dict: dict) -> 'RestaurantOrderState':
+        """Validate state using Pydantic model"""
         try:
+            # Convert order_items to proper format for Pydantic validation
             if "order_items" in state_dict:
                 state_dict["order_items"] = [
                     OrderItem(**item) if isinstance(item, dict) else item
                     for item in state_dict["order_items"]
                 ]
+
+            # Validate using Pydantic model
             validated = RestaurantOrderStateModel(**state_dict)
+
+            # Convert back to TypedDict format
             return cls(
                 messages=validated.messages,
                 order_id=validated.order_id,
@@ -237,15 +240,17 @@ class RestaurantOrderState(TypedDict):
             logger.error(f"State validation error: {str(e)}")
             raise
 
-class InputState(TypedDict):
-    messages: List[AnyMessage]
-    conversation_rounds: int
+class InputState(TypedDict): # Input Schema
+    messages: List[AnyMessage] # User input messages
+    conversation_rounds: int = Field(default=0, description="Number of conversation exchanges")
 
-class OutputState(TypedDict):
-    messages: List[AIMessage]
+class OutputState(TypedDict): # Output Schema
+    messages: List[AIMessage] # Agent output messages
+
 
 # -------------------------- Tools Section -------------------------- #
 from langchain_core.messages import BaseMessage
+
 
 @tool
 def get_drinks_menu() -> str:
@@ -262,6 +267,7 @@ def get_drinks_menu() -> str:
     - Green Tea
     - Black Tea
     """
+
 
 @tool
 def get_food_menu() -> str:
@@ -311,14 +317,15 @@ def get_food_menu() -> str:
 
 @tool
 def get_menu_item_price(item_name: str) -> str:
-    """Call this to get the price of a specific menu item."""
+    """Call this to get the price of a specific menu item.
+    Returns the price if item exists, or an error message if not found."""
     if item_name in menu_prices:
         return f"{item_name} costs ${menu_prices[item_name]:.2f}"
     return f"Item '{item_name}' not found in menu"
 
 @tool
 def get_restaurant_info() -> str:
-    """Call this to get information about the restaurant."""
+    """Call this to get information about the restaurant, including its history, hours, and accolades."""
     return """
     === VILLA TOSCANA ===
 
@@ -353,90 +360,244 @@ def get_restaurant_info() -> str:
     Address: 123 Olive Garden Street, Metropolis, MB 12345
     """
 
-@tool
-def create_order(order_items: List[OrderItem], current_order_id: Optional[str] = None) -> str:
+def check_and_update_stock(item_name: str, quantity: int) -> str:
     """
-    Creates or updates the current order.
-    If no current_order_id is provided, a new UUID is generated.
-    The provided order_items (a list of OrderItem objects) are used for the order.
+    Check if the specified item is in stock in the relevant department.
+    If in stock, decrement the inventory and return 'fulfilled'.
+    If not enough stock, return 'insufficient_stock'.
+    If item not found, return 'item_not_found'.
     """
-    if current_order_id and current_order_id.strip() != "":
-        order_id = current_order_id
-        action = "updated"
-    else:
-        order_id = get_new_order_id()
-        action = "created"
-    subtotal = sum(menu_prices.get(item.name, 0.0) * item.quantity for item in order_items)
-    tip = round(subtotal * 0.15, 2)
-    total = round(subtotal + tip, 2)
-    return f"Order {order_id} {action} successfully with status 'pending'. Total cost (including 15% tip) is ${total:.2f}."
-
-@tool
-def process_order(order_id: str, order_items: List[OrderItem]) -> str:
-    """
-    Processes the current order.
-    Checks stock for each item and updates the status accordingly.
-    """
-    if not order_id:
-        return "No order found. Please create an order first."
-    all_fulfilled = True
-    for item in order_items:
-        if item.status == "pending":
-            result = check_and_update_stock(item.name, item.quantity)
-            if "fulfilled" in result:
-                dept = result.split(" in ")[-1]
-                item.department = dept
-                item.status = "fulfilled"
-            elif "insufficient_stock" in result:
-                all_fulfilled = False
+    logger.info(f"Checking stock for item: {item_name}, quantity: {quantity}")
+    for department, items in DEPARTMENT_STOCKS.items():
+        if item_name in items:
+            if items[item_name] >= quantity:
+                items[item_name] -= quantity
+                logger.info(f"Stock fulfilled: {item_name} - {quantity} from {department}")
+                return f"fulfilled in {department}"
             else:
-                all_fulfilled = False
-    status_message = "fully fulfilled" if all_fulfilled else "partially fulfilled"
-    return f"Order {order_id} processed and is {status_message}."
+                logger.warning(f"Insufficient stock for {item_name} in {department}")
+                return f"insufficient_stock in {department}"
+    logger.error(f"Item not found in any department: {item_name}")
+    return "item_not_found"
+
+def should_summarize(state: RestaurantOrderState) -> bool:
+    logger.info(f"Conversation rounds: {state['conversation_rounds']}")
+    return state["conversation_rounds"] >= 6
+
+
+def conversation_summarizer(state: RestaurantOrderState) -> RestaurantOrderState: # Node function now works with OverallState
+    """Generate and store conversation summary"""
+    global system_message
+    logger.info("Generating conversation summary")
+    messages = [msg for msg in state["messages"] if isinstance(msg, (HumanMessage, AIMessage))]
+    logger.info(f"Total messages in conversation_summarizer: {len(messages)}")
+    # Create summary prompt
+    summary_prompt = [
+        SystemMessage(content="Summarize the conversation provided below. Focus on extracting and preserving key details such as order items, quantities, dietary preferences, and payment status if mentioned.  Crucially, **only summarize information that is explicitly stated in the conversation**. Do not invent, infer, or hallucinate any details that are not directly mentioned. Keep track of important customer information and preferences that are explicitly stated."),
+        HumanMessage(content="\n".join([
+            f"{'User' if isinstance(m, HumanMessage) else 'Waiter'}: {m.content}"
+            for m in messages[:12]  # first 8 messages
+        ]))
+    ]
+
+    # Generate summary
+    summary = gemini_llm.invoke(summary_prompt).content
+    logger.info(f"Generated summary: {summary}")
+
+    #delete previous messages except system message and last 4 messages, and the last 4 messages should be human messages and ai messages
+    delete_messages = [msg for msg in state["messages"] if not isinstance(msg, SystemMessage) and not isinstance(msg, HumanMessage) and not isinstance(msg, AIMessage)]
+    # Keep only the system message and last few messages
+    logger.info(f"delete message: {delete_messages}")
+    logger.info(f"length of state messages before deletion: {len(state['messages'])}")
+    logger.info(f"Messages before summarization: {state['messages']}") # Log messages before summarization
+    # Keep only the system message and last few messages
+    new_messages = [system_message] + messages[-4:]
+    logger.info(f"Messages after summarization and deletion: {new_messages}") # Log messages after summarization
+    #if there is already a summary, append the new summary to the existing summary
+    if state['summary']:
+        summary = f"{state['summary']}\n{summary}"
+    # Update state
+    updated_state_dict = { # Create a dict first then validate
+        "messages": new_messages,
+        "order_id": state["order_id"],
+        "order_items": state["order_items"],
+        "order_status": state["order_status"],
+        "total_cost": state["total_cost"],
+        "payment_status": state["payment_status"],
+        "conversation_rounds": 0,  # Reset counter
+        "summary": summary
+    }
+    updated_state = RestaurantOrderState.validate_state(updated_state_dict) # Validate and create RestaurantOrderState
+    logger.info(f"current state: {state}")
+    logger.info(f"State before summarizer returns: {updated_state}")
+    return updated_state
+
 
 @tool
-def cashier_calculate_total(order_id: str, order_items: List[OrderItem]) -> float:
+def cashier_calculate_total(order_id: int) -> float:
     """
-    Calculates the total for the order (items’ prices plus a 15% tip).
+    Calculates the total cost of the entire order (sum of item prices)
+    plus 15% tip. Updates the 'total_cost' field in the order.
+    Returns the total amount.
     """
-    subtotal = sum(menu_prices.get(item.name, 0.0) * item.quantity for item in order_items)
-    tip = round(subtotal * 0.15, 2)
-    total = round(subtotal + tip, 2)
-    logger.info(f"Calculated total for order {order_id}: ${total}")
+    logger.info(f"Calculating total for order {order_id}")
+    if not orders:
+        logger.warning("No orders exist in the system")
+        return "create an order first"
+
+    if order_id not in orders:
+        logger.error(f"Order {order_id} not found")
+        return 0.0
+
+    order_data = orders[order_id]
+    subtotal = 0.0
+    for item in order_data["items"]:
+        name = item["name"]
+        qty = item["quantity"]
+        price = menu_prices.get(name, 0.0)
+        subtotal += price * qty
+
+    tip_amount = subtotal * 0.15
+    total = round(subtotal + tip_amount, 2)
+
+
+    logger.info(f"Order {order_id} total calculated: ${total}")
     return total
 
+
 @tool
-def check_payment(amount: float, method: str, total_due: float, order_id: str) -> str:
+def check_payment(amount: float, method: str, order_id: int ) -> str:
     """
-    Processes the payment for the order.
-    For cash, checks for sufficient funds; 
-    for card, uses an 80% chance of success.
+    Processes the payment.
+    - method = "cash": returns "cash_ok" or "insufficient_funds" if amount < total
+    - method = "card": 80% chance "valid", 20% chance "invalid"
+    If payment is successful, updates order status to "paid".
     """
     logger.info(f"Processing payment: ${amount} via {method} for order {order_id}")
+    if order_id not in orders: # Accessing global orders is still fine for tool as it's external data
+        logger.error(f"Order {order_id} not found during payment")
+        return "order_not_found"
+
+    order_data = orders[order_id] # Accessing global orders
+    total_due = order_data["total_cost"]
+
     if method.lower() == "cash":
         if amount < total_due:
-            logger.warning(f"Insufficient cash: ${amount} < ${total_due}")
+            logger.warning(f"Insufficient cash payment: ${amount} < ${total_due}")
             return "insufficient_funds"
+        # Payment success; calculate change
         change = round(amount - total_due, 2)
+        # order_data["status"] = "paid" # No longer directly updating global orders
+        logger.info(f"Cash payment successful for order {order_id}. Change: ${change}")
         return f"cash_ok with change {change}"
+
     elif method.lower() == "card":
+        # 80% success
         if random.random() < 0.8:
+            # order_data["status"] = "paid" # No longer directly updating global orders
             logger.info(f"Card payment successful for order {order_id}")
             return "valid"
         else:
             logger.warning(f"Card payment failed for order {order_id}")
             return "invalid"
+
     else:
         logger.error(f"Unknown payment method: {method}")
         return "unknown_method"
 
+
+@tool
+def create_order(order_items: List[OrderItem]) -> str:
+    """
+    Creates a new order with status 'pending', given a list of order items in JSON format,
+    for example:
+    [
+        {"name": "Bruschetta", "quantity": 2},
+        {"name": "Lobster Tail", "quantity": 1}
+    ]
+    Returns the newly created order ID.
+    """
+    try:
+        # Validate order items using Pydantic
+        
+    
+        global orders
+        logger.info(f"Creating new order with items: {order_items}")
+        order_id = get_new_order_id()
+
+        orders[order_id] = {
+            "items": [item.model_dump() for item in order_items],
+            "status": "pending",
+            "total_cost": 0.0,
+        }
+        logger.info(f"Order {order_id} created successfully")
+        return f"New order {order_id} created with status 'pending'."
+
+    except ValidationError as e:
+        logger.error(f"Order validation error: {str(e)}")
+        return f"Error creating order: {str(e)}"
+
+
+@tool
+def process_order(order_id: int) -> str:
+    """
+    Processes an existing order:
+    1. Checks each item's department stock via check_and_update_stock.
+    2. If insufficient stock for any item, that item remains pending,
+       and the overall order might be partially_fulfilled.
+    3. If all items fulfilled, order is marked 'fulfilled'.
+    """
+    global orders # Still using global orders for simplicity
+    logger.info(f"Processing order {order_id}")
+    if order_id not in orders: # Accessing global orders
+        logger.error(f"Order {order_id} not found")
+        return "order_not_found"
+
+    order_data = orders[order_id] # Accessing global orders
+    logger.info(f"Order {order_id} status: {order_data['status']}")
+    if order_data["status"] not in ["pending", "partially_fulfilled"]:
+        logger.warning(f"Cannot process order {order_id} in state: {order_data['status']}")
+        return f"cannot_process_order_in_state_{order_data['status']}"
+
+    all_fulfilled = True
+    for item in order_data["items"]:
+        if item["status"] == "pending":
+            # call tool check_and_update_stock item_name, quantity
+            logger.info(f"Checking stock for {item['name']} x{item['quantity']} in process_order")
+            result = check_and_update_stock(item["name"], item["quantity"])
+            logger.info(f"Stock check result for {item['name']}: {result} in process_order")
+            if "fulfilled" in result:
+                # Mark item fulfilled; record department
+                dept = result.split(" in ")[-1]
+                item["department"] = dept
+                item["status"] = "fulfilled"
+            elif "insufficient_stock" in result:
+                all_fulfilled = False
+            else:
+                # item not found or another error
+                all_fulfilled = False
+
+    if all_fulfilled:
+        order_data["status"] = "fulfilled" # Updating global orders
+        logger.info(f"Order {order_id} fully fulfilled")
+        return f"Order {order_id} is fully fulfilled."
+    else:
+        # If at least one item remains "pending", the order is partially fulfilled
+        order_data["status"] = "partially_fulfilled" # Updating global orders
+        logger.warning(f"Order {order_id} partially fulfilled")
+        return f"Order {order_id} is partially fulfilled. Some items are not available or still pending."
+
+
 # -------------------------- LLM and Workflow Initialization -------------------------- #
+
+# Initialize the AzureChatOpenAI LLM
 AZURE_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_4O = os.getenv("OPENAI_MODEL_4o")
 OPENAI_MODEL_O1MINI = os.getenv("OPENAI_MODEL_O1MINI")
 AZURE_API_VERSION = os.getenv("AZURE_API_VERSION")
-AZURE_OPENAI_4OMINI = os.getenv("OPENAI_MODEL_4OMINI")
+
+AZURE_OPENAI_4OMINI= os.getenv("OPENAI_MODEL_4OMINI")
 
 llm = AzureChatOpenAI(
     api_key=AZURE_OPENAI_API_KEY,
@@ -447,10 +608,11 @@ llm = AzureChatOpenAI(
     max_tokens=4000
 )
 
+
 DEEPSEEK_ENDPOINT = os.getenv("DEEPSEEK_ENDPOINT")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL")
-deepseek_llm = ChatOpenAI(
+deepseek_llm=ChatOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url=DEEPSEEK_ENDPOINT,
     model=DEEPSEEK_MODEL,
@@ -459,17 +621,11 @@ deepseek_llm = ChatOpenAI(
 )
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL_FLASH20 = os.getenv("GEMINI_MODEL_FLASH20")
-GEMINI_MODEL_FLASH15 = os.getenv("GEMINI_MODEL_FLASH15")
-gemini_llm = ChatGoogleGenerativeAI(
-    model=GEMINI_MODEL_FLASH20,
-    api_key=GEMINI_API_KEY,
-    temperature=0.5,
-    max_tokens=4096,
-    timeout=60,
-    transport="rest"
-)
+GEMINI_MODEL_FLASH20= os.getenv("GEMINI_MODEL_FLASH20")
+GEMINI_MODEL_FLASH15= os.getenv("GEMINI_MODEL_FLASH15")
+gemini_llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL_FLASH20, api_key=GEMINI_API_KEY, temperature=0.5, max_tokens=4096,timeout=60,transport="rest")
 
+# Add our expanded tools
 tools = [
     get_drinks_menu,
     get_food_menu,
@@ -479,11 +635,15 @@ tools = [
     check_payment,
     get_restaurant_info,
     get_menu_item_price,
+    # conversation_summarizer, # Removed summarizer from tools
 ]
-tool_node = ToolNode(tools)
-model_with_tools = gemini_llm.bind_tools(tools)
 
-def should_continue(state: RestaurantOrderState) -> Literal["tools", "__end__"]:
+tool_node = ToolNode(tools)
+model_with_tools =  gemini_llm.bind_tools(tools)
+
+#custom tools condition, can be modified and used in the workflow with workflow.add_conditional_edges if needed
+
+def should_continue(state: RestaurantOrderState) -> Literal["tools", "__end__"]: # Output type is now Literal
     messages = state['messages']
     last_message = messages[-1]
     logger.info(f"Last tool message: {last_message}")
@@ -493,132 +653,151 @@ def should_continue(state: RestaurantOrderState) -> Literal["tools", "__end__"]:
     logger.info("Last message is not a tool call")
     return END
 
-def call_model_with_tools(state: RestaurantOrderState) -> RestaurantOrderState:
+def call_model_with_tools(state: RestaurantOrderState) -> RestaurantOrderState: # Node function now works with OverallState
     messages = state['messages']
-    logger.info(f"State in call_model_with_tools: {state}")
+    logger.info(f"state in call model: {state}")
     summary = state.get('summary', '')
     global system_message
     if state["conversation_rounds"] >= 6:
-        state = conversation_summarizer(state)
-        messages = state['messages']
+        state = conversation_summarizer(state) # Summarize before LLM call
+        messages = state['messages'] # Get updated messages
+        # Filter out empty AIMessages with tool calls
         filtered_messages = [
             msg for msg in messages 
-            if not (isinstance(msg, AIMessage) and msg.content == '' and (msg.additional_kwargs.get('function_call') or msg.tool_calls))
+            if not (
+                isinstance(msg, AIMessage) and 
+                msg.content == '' and 
+                (msg.additional_kwargs.get('function_call') or msg.tool_calls)
+            )
         ]
-        other_messages = [msg for msg in filtered_messages if not isinstance(msg, SystemMessage)]
-        if summary:
+        
+        other_messages = [
+            msg for msg in filtered_messages 
+            if not isinstance(msg, SystemMessage)
+        ]
+
+        if summary :
+            # Add summary as AIMessage after system message
             summary_message = AIMessage(content=f"Conversation Summary:\n{summary}")
             messages = [system_message, summary_message] + other_messages
         else:
             messages = filtered_messages
         app.update_state(values={"messages": messages}, config=config)
-        logger.info(f"Updated state after summarizer: {state}")
+        logger.info(f"---------------Updated state after summarizer in should_summarize call_model_with_tools: {state}---------------------") 
+
+
     try:
-        if isinstance(messages[-1], HumanMessage) and summary:
-            summary_message = AIMessage(content=f"Conversation Summary:\n{state['summary']}")
-            messages = [system_message, summary_message] + messages[-4:]
+        if isinstance(messages[-1], HumanMessage):
+            if summary:
+            # Add summary as AIMessage after system message
+                summary_message = AIMessage(content=f"Conversation Summary:\n{state['summary']}")
+                messages = [system_message, summary_message] + messages[-4:]
+        
         logger.info(f"LLM input: {messages}")
-        messages = [msg for msg in messages if not (isinstance(msg, AIMessage) and msg.content == '' and not msg.additional_kwargs.get('function_call'))]
+        #filter any AI message and the additional_kwargs is not 'function_call' that the content is empty
+        messages=  [msg for msg in messages if not (isinstance(msg, AIMessage) and msg.content == '' and not msg.additional_kwargs.get('function_call'))]
         response = model_with_tools.invoke(messages)
         logger.info(f"LLM response: {response}")
-        updated_state_dict = {
-            "messages": [response],
-            "order_id": state.get('order_id', ""),
-            "order_items": state.get('order_items', []),
-            "order_status": state.get('order_status', 'pending'),
-            "total_cost": state.get('total_cost', 0.0),
-            "payment_status": state.get('payment_status', 'pending'),
-            "conversation_rounds": state.get('conversation_rounds', 0),
-            "summary": state.get('summary', '')
+
+        updated_state_dict = { # Create a dict first then validate
+                "messages":[response],
+                "order_id": state.get('order_id', 0),
+                "order_items":state.get('order_items', []),
+                "order_status": state.get('order_status', 'pending'),
+                "total_cost": state.get('total_cost', 0.0),
+                "payment_status": state.get('payment_status', 'pending'),
+                "conversation_rounds": state.get('conversation_rounds', state.get('conversation_rounds',0)), # Keep rounds if not summarized, otherwise already reset in summarizer
+                "summary": state.get('summary', '')
         }
-        updated_state = RestaurantOrderState.validate_state(updated_state_dict)
+        updated_state = RestaurantOrderState.validate_state(updated_state_dict) # Validate and create RestaurantOrderState
         logger.info(f"Updated state: {updated_state}")
-        return updated_state
+        return updated_state # directly return the validated state object
     except Exception as e:
         logger.error(f"LLM invoke error: {str(e)}", exc_info=True)
         error_message = AIMessage(content="I apologize, but I'm having trouble processing your request. Could you please try again?")
-        updated_state_dict = {
-            "messages": [error_message],
-            "order_id": state.get('order_id', ""),
-            "order_items": state.get('order_items', []),
-            "order_status": state.get('order_status', 'pending'),
-            "total_cost": state.get('total_cost', 0.0),
-            "payment_status": state.get('payment_status', 'pending'),
-            "conversation_rounds": state.get('conversation_rounds', 0),
-            "summary": state.get('summary', '')
+        updated_state_dict = { # Create a dict first then validate
+               "messages":[error_message],
+                "order_id": state.get('order_id', 0),
+                "order_items":state.get('order_items', []),
+                "order_status": state.get('order_status', 'pending'),
+                "total_cost": state.get('total_cost', 0.0),
+                "payment_status": state.get('payment_status', 'pending'),
+                "conversation_rounds": state.get('conversation_rounds', state.get('conversation_rounds',0)), # Keep rounds if not summarized
+                "summary": state.get('summary', '')
         }
-        updated_state = RestaurantOrderState.validate_state(updated_state_dict)
-        return updated_state
+        updated_state = RestaurantOrderState.validate_state(updated_state_dict) # Validate and create RestaurantOrderState
+        return updated_state # directly return the validated state object
+
 
 # Build the state graph
-workflow = StateGraph(RestaurantOrderState, input=InputState, output=OutputState)
-memory = MemorySaver()
+workflow = StateGraph(RestaurantOrderState, input=InputState, output=OutputState) # Use custom state schema with input/output types
+memory=MemorySaver()
 workflow.add_node("agent", call_model_with_tools)
 workflow.add_node("tools", tool_node)
+# workflow.add_node("summarizer", conversation_summarizer) # Removed summarizer node
+
+#the add conditional edges also has problem
 workflow.add_edge(START, "agent")
-workflow.add_conditional_edges("agent", tools_condition)
+workflow.add_conditional_edges(
+    "agent",
+   tools_condition
+)
+
 workflow.add_edge("tools", "agent")
+# workflow.add_edge("summarizer", "agent") # Removed summarizer edge
 workflow.add_edge("agent", END)
 
 app = workflow.compile(checkpointer=memory)
 config = {"configurable": {"thread_id": "1"}}
 
-# Updated system prompt now includes the state schema
-system_message = SystemMessage(
-    content=(
-       "You are a waiter at Villa Toscana, an upscale Italian restaurant. "
-       "Current Order State Schema:\n"
-       "  - order_id: Unique order identifier (UUID string)\n"
-       "  - order_items: List of items (each with name, quantity, department, and status: pending/fulfilled)\n"
-       "  - order_status: One of pending, processing, fulfilled, billed, paid, or partially_fulfilled\n"
-       "  - total_cost: Total cost of the order\n"
-       "  - payment_status: One of pending, paid, or failed\n"
-       "  - conversation_rounds: Number of dialogue exchanges\n"
-       "  - summary: A short summary of the conversation\n\n"
-       "You will greet the user and help them with restaurant menus, orders, billing, and payment processing. "
-       "Always use create_order to create/update a customer's order. If an order already exists in the state, update its order_items. "
-       "When providing answers or taking actions, consult and update the state accordingly. "
-       "Only call tools to answer the user's query. Remain polite, confirm orders, and handle small talk briefly before refocusing on restaurant matters."
-    )
-)
+# Initial system message
 
 if __name__ == "__main__":
     logger.info("Starting restaurant waiter service with custom state")
     print("Welcome to the restaurant! Type 'q' to quit the conversation.")
+
     try:
-        app.update_state(values={
-            "messages": [system_message],
-            "order_id": "",
-            "order_items": [],
-            "order_status": "pending",
-            "total_cost": 0.0,
-            "payment_status": "pending",
-            "conversation_rounds": 0,
-            "summary": ""
-        }, config=config)
+        app.update_state(values={ # Create a dict first then validate
+        "messages": [system_message],
+        "order_id": 0,
+        "order_items": [],
+        "order_status": "pending",
+        "total_cost": 0.0,
+        "payment_status": "pending",
+        "conversation_rounds": 0,
+        "summary": ""
+    },config=config)
         while True:
             user_input = input("\nYou: ")
+
             if user_input.lower() == 'q':
                 logger.info("User ended conversation")
                 print("Thank you for visiting! Goodbye!")
                 break
+
             logger.info(f"User input: {user_input}")
             user_message = HumanMessage(content=user_input, name="user")
             current_state = app.get_state(config)
-            app.update_state(values={"conversation_rounds": current_state[0]['conversation_rounds'] + 1}, config=config)
+            update_convervation_rounds = app.update_state(values={"conversation_rounds":current_state[0]['conversation_rounds']+1},config=config)
+
             try:
+                # Update state with validation
                 updated_state_dict = {
                     "messages": list(current_state[0]['messages']) + [user_message]
                 }
+
                 validated_state = RestaurantOrderState.validate_state(updated_state_dict)
                 result = app.invoke(updated_state_dict, config=config)
+
                 ai_messages = [msg for msg in result['messages'] if isinstance(msg, AIMessage)]
                 if ai_messages:
                     print("\nWaiter:", ai_messages[-1].content)
                     logger.info(f"AI response: {ai_messages[-1].content}")
+
             except ValidationError as e:
                 logger.error(f"State validation error: {str(e)}")
                 print("\nWaiter: I apologize, but there was an error with your order. Please try again.")
+
     except Exception as e:
         logger.error(f"Critical error: {str(e)}", exc_info=True)
         print("\nWaiter: I apologize, but our system is currently unavailable. Please try again later.")
