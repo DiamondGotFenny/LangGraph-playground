@@ -1,12 +1,13 @@
 import logging
 import os
 
-def setup_logger(log_file: str = "vector_store_agent.log") -> logging.Logger:
+def setup_logger(log_file: str = "vector_store_agent.log", log_to_console: bool = True) -> logging.Logger:
     """
     Sets up the logger to record logs to a specified file with UTF-8 encoding.
 
     Args:
         log_file (str): Path to the log file.
+        log_to_console (bool): If True, also log to console (stderr).
 
     Returns:
         logging.Logger: Configured logger instance.
@@ -19,32 +20,33 @@ def setup_logger(log_file: str = "vector_store_agent.log") -> logging.Logger:
     # Configure the logger
     logger = logging.getLogger("VectorStoreAgentLogger")
     logger.setLevel(logging.INFO)
+    logger.propagate = False
 
-    # Prevent adding multiple handlers if the logger already has handlers
-    if not logger.handlers:
-        # Create file handler which logs messages with UTF-8 encoding
-        try:
-            fh = logging.FileHandler(log_file, encoding='utf-8')
-        except TypeError:
-            # For Python versions < 3.9 where 'encoding' might not be supported
-            fh = logging.FileHandler(log_file)
-            fh.stream = open(log_file, 'a', encoding='utf-8')
+    # Reset handlers to keep behavior predictable across repeated imports/runs
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
 
-        fh.setLevel(logging.INFO)
+    # Create file handler which logs messages with UTF-8 encoding
+    try:
+        fh = logging.FileHandler(log_file, encoding='utf-8')
+    except TypeError:
+        # For Python versions < 3.9 where 'encoding' might not be supported
+        fh = logging.FileHandler(log_file)
+        fh.stream = open(log_file, 'a', encoding='utf-8')
 
-        # Create console handler for real-time feedback
+    fh.setLevel(logging.INFO)
+
+    # Define log message format
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+
+    # Add handlers to the logger
+    logger.addHandler(fh)
+
+    if log_to_console:
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
-
-        # Define log message format
-        formatter = logging.Formatter(
-            '%(asctime)s - %(levelname)s - %(message)s'
-        )
-        fh.setFormatter(formatter)
         ch.setFormatter(formatter)
-
-        # Add handlers to the logger
-        logger.addHandler(fh)
         logger.addHandler(ch)
 
     return logger
