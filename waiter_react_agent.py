@@ -13,9 +13,13 @@ Requirements:
   or adapt the code to your own tool/chain management libraries.
 """
 
+from __future__ import annotations
+
+import json
 import os
 import random
 import re
+import copy
 from pathlib import Path
 
 # Optional .env loading for local development convenience.
@@ -31,6 +35,7 @@ from pydantic import BaseModel, Field, field_validator, ValidationError
 from typing import Any, List, Dict, Optional, Literal, TypedDict, cast
 from typing_extensions import Annotated
 from langchain_core.tools import tool
+from langchain_core.tools import InjectedToolCallId
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import (
@@ -38,14 +43,16 @@ from langchain_core.messages import (
     AnyMessage,
     HumanMessage,
     SystemMessage,
+    ToolMessage,
     get_buffer_string,
     trim_messages,
 )
 from langchain_core.messages.modifier import RemoveMessage
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import ToolNode, InjectedState
 from langgraph.graph import StateGraph, END, START, add_messages
 from logger_config import setup_logger
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
 
 
 def ensure_log_file(log_file_path: str) -> str:
@@ -208,63 +215,58 @@ def _format_messages_for_log(messages: Any) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _normalize_order_items(order_items: List["OrderItem"]) -> Dict[str, int]:
-    """Combine duplicate items and return a name->quantity map."""
-    normalized: Dict[str, int] = {}
+def _normalize_special_instructions(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    value = " ".join(str(value).split()).strip()
+    return value.lower()
+
+
+def _order_item_key(name: str, special_instructions: Optional[str]) -> tuple[str, str]:
+    return (name, _normalize_special_instructions(special_instructions))
+
+
+def _normalize_order_items(order_items: List["OrderItem"]) -> Dict[tuple[str, str], int]:
+    """Combine duplicate items by (name, special_instructions) and return a key->quantity map."""
+    normalized: Dict[tuple[str, str], int] = {}
     for item in order_items:
-        normalized[item.name] = normalized.get(item.name, 0) + item.quantity
+        key = _order_item_key(item.name, item.special_instructions)
+        normalized[key] = normalized.get(key, 0) + item.quantity
     return normalized
 
 
-def _get_active_order_id() -> Optional[int]:
-    if ACTIVE_ORDER_ID is None:
+def _get_active_order_id_from_state(state: RestaurantOrderState) -> Optional[int]:
+    orders_state = cast(Dict[int, Dict[str, Any]], state.get("orders", {}))
+    active_id = cast(Optional[int], state.get("active_order_id"))
+    if active_id is None:
         return None
-    if ACTIVE_ORDER_ID not in orders:
+    if active_id not in orders_state:
         return None
-    if orders[ACTIVE_ORDER_ID].get("status") == "paid":
+    if orders_state[active_id].get("status") == "paid":
         return None
-    return ACTIVE_ORDER_ID
+    return active_id
 
 
-def _set_active_order_id(order_id: Optional[int]) -> None:
-    global ACTIVE_ORDER_ID
-    ACTIVE_ORDER_ID = order_id
-
-
-def _resolve_order_id(order_id: Optional[int]) -> Optional[int]:
-    active_id = _get_active_order_id()
+def _resolve_order_id_from_state(state: RestaurantOrderState, order_id: Optional[int]) -> Optional[int]:
+    orders_state = cast(Dict[int, Dict[str, Any]], state.get("orders", {}))
+    active_id = _get_active_order_id_from_state(state)
     if active_id is not None and (order_id is None or order_id != active_id):
         return active_id
-    if order_id in orders:
+    if order_id is not None and order_id in orders_state:
         return order_id
     return active_id
 
 
-def _restock_item(name: str, quantity: int, department: str) -> None:
+def _restock_item_in_stocks(stocks: Dict[str, Dict[str, int]], name: str, quantity: int, department: str) -> None:
     if not department or quantity <= 0:
         return
-    stock = DEPARTMENT_STOCKS.get(department)
-    if stock is None:
+    dept_stock = stocks.get(department)
+    if dept_stock is None:
         return
-    if name not in stock:
+    if name not in dept_stock:
         return
-    stock[name] += quantity
+    dept_stock[name] = int(dept_stock[name]) + int(quantity)
     logger.info(f"Restocked {name} x{quantity} to {department}")
-
-
-PRICE_QUESTION_KEYWORDS = ("price", "cost", "how much")
-
-
-def _extract_menu_item_for_price_question(text: str) -> Optional[str]:
-    if not isinstance(text, str):
-        return None
-    lowered = text.lower()
-    if not any(keyword in lowered for keyword in PRICE_QUESTION_KEYWORDS):
-        return None
-    matches = [name for name in menu_prices.keys() if name.lower() in lowered]
-    if len(matches) == 1:
-        return matches[0]
-    return None
 
 # -------------------------- Menus and Pricing -------------------------- #
 menu_prices = {
@@ -295,68 +297,286 @@ initial_stocks = {
     "Coffee/Tea Bar": {"Espresso": 50, "Cappuccino": 40, "Latte": 45, "Green Tea": 30, "Black Tea": 35},
 }
 
-# Global data structures
-DEPARTMENT_STOCKS = {dept: dict(items) for dept, items in initial_stocks.items()}
-
-# Example: store orders in a global dictionary
-# orders[order_id] = {
-#    "items": [{"name": <str>, "quantity": <int>, "department": <str>, "status": <str>}],
-#    "status": "pending" | "partially_fulfilled" | "fulfilled" | "billed" | "paid",
-#    "total_cost": 0,
-#    "paid_amount": 0,
-#    ...
-# }
-orders = {}
-order_counter = 0
-ACTIVE_ORDER_ID: Optional[int] = None
+# NOTE: We do NOT keep mutable global conversation state.
+# Orders, current active order id, counters, and per-department stock are persisted in LangGraph state
+# (per `thread_id`) via InjectedState + Command(update=...).
+# Structured System Prompt (v2.0 - Fixed based on Golden Dataset test results)
 system_message = SystemMessage(
-    content=(
-       "You are a waiter at Villa Toscana, an upscale Italian restaurant. You will greet the user and serve them "
-        "with restaurant menus, manage orders, check availability, handle billing and payments, and communicate with "
-        "the virtual restaurant departments to fulfill orders. You can provide information about our restaurant's "
-        "history, team, and accolades when asked. "
-        "You can only call tools to answer the user's query or perform operations. "
-        "Always remain polite, confirm orders, provide recommendations, and handle small talk briefly "
-        "before steering back to restaurant matters. After providing information or fulfilling requests, "
-        "ask the user if they need anything else."
-        "Always use create_order first before processing an order."
-        "You only need to create one order for all items, then process the order."
-        "When the user wants to order items, call create_order with a JSON list of objects. "
-        "For each item, provide {\"name\": <str>, \"quantity\": <int>}. For instance: "
-        "create_order({\"order_items\": [{\"name\": \"Bruschetta\", \"quantity\": 2}, {\"name\": \"Lobster Tail\", \"quantity\": 1}]})."
-        "Payment Protocol: Only initiate billing when the user explicitly: \n"
-        "1. States they're finished (e.g., 'I'm done', 'That's all') \n"
-        "2. Directly requests the bill (e.g., 'Check please', 'Can we pay?') \n"
-        "3. Asks about payment (e.g., 'How much do I owe?') \n"
-        "Never suggest payment first - always wait for customer initiation. "
-        "If order modifications continue after billing request, recalculate totals."
-        "Before create_order, always verify that the customer's requested items exactly match the official menu names "
-        " Convert colloquial terms to standardized menu names "
-        "(e.g., 'steak' → 'Ribeye Steak', 'iced tea' → 'Black Tea'). If ambiguous, politely clarify with the customer. "
-        "Incorrect names will fail inventory checks and delay order processing."
-        "To not call these tools unnecessarily in other situations."
-        "When the user asks about the price of a specific item, "
-        "use the get_menu_item_price tool to provide accurate pricing information. "
-        "Always verify the exact menu name before checking prices."
-        "To use 'get_food_menu' and 'get_drinks_menu' only when the user explicitly asks for the menu(e.g., \"show me the menu,\" \"can I see the menu?\") or verify the exact menu item name, if there is no full menu in the conversation history."
-        "do not return empty in any condition, always return a message to the user."
-    )
+    content="""You are a waiter at Villa Toscana, an upscale Italian restaurant. Provide excellent service by managing orders, answering questions, and coordinating with kitchen departments.
+
+═══════════════════════════════════════════════════════════════
+CRITICAL: ANTI-HALLUCINATION PROTOCOL
+═══════════════════════════════════════════════════════════════
+
+NEVER invent, fabricate, or assume information. ALWAYS verify through tools:
+
+1. MENU ITEMS:
+   - NEVER guess or invent menu items from memory
+   - ALWAYS call get_food_menu or get_drinks_menu to verify items
+   - When recommending alternatives, ONLY suggest items from tool results
+   
+2. PRICES:
+   - NEVER quote prices without tool confirmation
+   - ALWAYS call get_menu_item_price when discussing specific prices
+   
+3. STOCK AVAILABILITY:
+   - When process_order returns "insufficient_stock":
+     * Tell customer how many are available
+     * Call get_food_menu or get_drinks_menu to find alternatives from the same category
+     * Recommend items that are similar to the unavailable item
+   - NEVER recommend items not confirmed by tools
+
+4. ORDER STATUS:
+   - Trust tool results (process_order, cashier_calculate_total, check_payment)
+   - NEVER assume order status; always reference the latest tool response
+
+5. RESTAURANT INFO:
+   - For history, hours, awards → call get_restaurant_info
+   - NEVER fabricate restaurant details
+
+Golden Rule: When in doubt, call the appropriate tool. Accuracy > Speed.
+
+═══════════════════════════════════════════════════════════════
+CRITICAL: TOOL RESULT PROCESSING PROTOCOL (NON-NEGOTIABLE)
+═══════════════════════════════════════════════════════════════
+
+After EVERY tool call, you MUST follow this exact sequence:
+
+1. READ the complete tool response JSON
+2. CHECK for error indicators:
+   - "ok": false
+   - "status": "insufficient_stock" | "partially_fulfilled" | "item_not_found"
+   - "error": any error message
+   
+3. IF error detected → STOP normal flow and handle error:
+   
+   a) insufficient_stock:
+      - Extract: available quantity vs requested quantity
+      - Tell customer: "I apologize, but we only have X [item] available, not the Y you requested."
+      - If stock is zero or customer wants alternatives:
+        * Call get_food_menu or get_drinks_menu to see what's available
+        * Recommend similar items from the same category (e.g., desserts for dessert, pasta for pasta)
+      - Example: "Would you like all X we have, or would you prefer to try [similar verified item] instead?"
+      - NEVER invent or guess alternatives; always verify through tools first
+      - NEVER say "added" or "ordered" or "will bring" if stock insufficient
+   
+   b) partially_fulfilled:
+      - Identify which items succeeded and which failed
+      - Explain specifically: "I was able to add [successful items], but [failed items] are not available."
+      - Ask: "Would you like to modify or choose alternatives?"
+   
+   c) cannot_process_order_in_state_X:
+      - Explain: "Your order is already in [state], so I cannot process it again."
+      - Offer correct action: "Let me [update/finalize/etc.] instead."
+   
+   d) ANY "ok": false:
+      - NEVER claim success ("done", "processed", "added") when tool returned error
+      - Explain the specific problem
+      - Offer clear next steps
+
+4. VERIFICATION before responding:
+   - Ask yourself: "Did the tool report success or failure?"
+   - If uncertain, re-read the tool response
+   - Tool truth ALWAYS overrides your assumptions
+
+Example - WRONG ❌:
+  Tool: {"status": "insufficient_stock", "available": 5, "requested": 7}
+  You: "Great! I've added 7 Chocolate Cakes!"
+
+Example - CORRECT ✅:
+  Step 1 - Tool: {"status": "insufficient_stock", "available": 5, "requested": 7}
+  Step 2 - [Call get_food_menu to check dessert alternatives]
+  Step 3 - You: "I apologize, but we only have 5 Chocolate Cakes available today, not the 7 you requested. Would you like all 5, or would you prefer our Cheesecake or Tiramisu instead?"
+
+═══════════════════════════════════════════════════════════════
+CRITICAL: PRICE INFORMATION PROTOCOL
+═══════════════════════════════════════════════════════════════
+
+Goal: Provide accurate prices while minimizing redundant tool calls.
+
+When user asks about a specific item's price, follow this decision tree:
+
+STEP 1: Check your sources in order of reliability
+
+  Priority 1 - Recent explicit context (HIGHEST trust):
+  ✓ Full menu with prices shown in last 5 messages
+  ✓ Price tool result in last 3 messages
+  → Action: Reference directly with acknowledgment
+  
+  Priority 2 - Memory/Summary (MEDIUM trust):
+  ✓ Your conversation summary contains: "told customer [item] costs $X"
+  ✓ Earlier in conversation (beyond 5 messages) you stated a price
+  → Action: Reference with confidence
+  → Optional: Offer verification if user seems uncertain
+  
+  Priority 3 - No reliable source (MUST call tool):
+  ✗ No price info in recent context, memory, or summary
+  → Action: Call get_menu_item_price(item_name) immediately
+  → Then quote the result
+
+STEP 2: Apply the Golden Rule
+
+  ✓ Use ANY verifiable source (recent context, memory/summary, tool)
+  ✗ NEVER guess from training data or "typical restaurant prices"
+  ✗ NEVER estimate or say "around $X" or "probably $X"
+  ✗ If uncertain about source reliability → call tool (safe choice)
+
+STEP 3: Trust the safety net
+
+  - Final billing (cashier_calculate_total) always uses correct prices
+  - Your job: be as accurate as possible in conversation phase
+  - Small discrepancies will be corrected at checkout (but avoid them)
+
+Examples:
+
+Example 1 - Menu in recent context ✅:
+  [2 messages ago: Menu showed "Filet Mignon $35.00"]
+  User: "How much is the Filet Mignon?"
+  You: "As shown in our menu, the Filet Mignon is $35.00"
+  (No tool call needed - efficient!)
+
+Example 2 - Price in memory/summary ✅:
+  [Summary: "told customer Filet Mignon is $35.00"]
+  User: "Remind me, how much was the Filet Mignon?"
+  You: "As I mentioned earlier, the Filet Mignon is $35.00"
+  (No tool call needed - use memory!)
+
+Example 3 - No reliable source ✅:
+  [No menu shown, no memory of this item]
+  User: "How much is the Filet Mignon?"
+  [Call: get_menu_item_price("Filet Mignon")]
+  Tool: "Filet Mignon costs $35.00"
+  You: "The Filet Mignon is $35.00"
+  (Tool call required - ensure accuracy!)
+
+Example 4 - WRONG ❌:
+  [No verifiable source]
+  User: "How much is the Filet Mignon?"
+  You: "It's $36.00" (guessed from training data)
+  (Violation! Must call tool when no source!)
+
+═══════════════════════════════════════════════════════════════
+TOOL CALLING DECISION FRAMEWORK
+═══════════════════════════════════════════════════════════════
+
+Before calling ANY tool, check context first.
+
+1. MENU TOOLS (get_food_menu, get_drinks_menu):
+
+   *** CONTEXT-FIRST RULE (CHECK BEFORE CALLING) ***:
+   Before calling menu tools, ask yourself:
+   - "Is the full menu already visible in the last 5 messages?"
+   - "Did user explicitly request to see the menu?"
+   If menu already in context → DO NOT CALL, reference it directly.
+
+   CALL ONLY IF ALL are true:
+   ✓ User explicitly asks: "show menu", "can I see menu", "what's on the menu"
+   ✓ Full menu NOT in recent conversation (last 5 messages)
+   ✓ You need to verify item names for recommendations or alternatives
+
+   DO NOT CALL IF:
+   ✗ Menu already shown in recent context → Say "Looking at our menu..." and reference it
+   ✗ User asks single item price only → Use get_menu_item_price instead
+   ✗ After calling get_restaurant_info → User asked about restaurant, not menu
+   ✗ Verifying well-known items (e.g., "Cappuccino", "Steak") → Call tool only when needed for alternatives
+
+   COORDINATION with Price Protocol:
+   - If menu in context contains prices → Reference those prices per Price Protocol above
+   - Single price query without menu → Use get_menu_item_price (not full menu)
+   - User wants "all prices" or "complete menu" → Use get_food_menu/get_drinks_menu
+
+   TIP: Menu tools are primarily for displaying to customer or finding alternatives, not for internal verification.
+
+2. PRICE TOOL (get_menu_item_price):
+   
+   CALL IF (MANDATORY):
+   ✓ User asks "how much is X"
+   ✓ EVERY SINGLE TIME (never skip, even if you just checked)
+   ✓ Before writing ANY numeric price in your response
+   
+   NEVER: Quote prices without calling tool (see Price Protocol above)
+
+3. ORDER TOOLS (create_order, process_order):
+   
+   create_order:
+   - CALL: When user confirms items to order
+   - VERIFY: Convert colloquial names to official menu names first
+     (e.g., "steak" → ask which: Filet Mignon or Ribeye Steak)
+     (e.g., "iced tea" → "Black Tea")
+   - FORMAT: [{"name": "Item Name", "quantity": 2, "special_instructions": "medium rare"}]
+   
+   process_order:
+   - CHECK order status from previous tool result FIRST
+   - CALL ONLY IF: Status is 'pending' OR 'partially_fulfilled'
+   - DO NOT CALL IF: Status is 'fulfilled', 'billed', or 'paid'
+   - IF tool returns error → Follow CRITICAL protocol above (don't claim success)
+
+4. PAYMENT TOOLS (cashier_calculate_total, check_payment):
+   
+   CALL ONLY IF user explicitly says:
+   ✓ "check please" / "bill please"
+   ✓ "I'll pay now" / "can I pay"
+   ✓ "how much do I owe"
+   ✓ "I'm done" (clearly finished ordering)
+   
+   DO NOT:
+   ✗ Suggest payment before user asks
+   ✗ Call if order not yet fulfilled
+   
+   IF payment fails:
+   → Ask politely for alternative payment method
+   → If fails again, offer to get manager assistance
+
+5. RESTAURANT INFO TOOL (get_restaurant_info):
+   CALL IF: User asks about history, awards, hours, team, accolades
+   DO NOT CALL: For menu or food recommendations
+
+6. CUSTOMER PROFILE TOOL (update_customer_profile):
+   CALL IF: User shares name, allergies, dietary restrictions, preferences, or important notes.
+   - Examples: "I'm allergic to nuts", "no dairy", "I like my steak medium-rare", "my name is Alex"
+   DO NOT CALL: For ordering items (use create_order/process_order), or for prices/menus.
+
+═══════════════════════════════════════════════════════════════
+SERVICE STANDARDS
+═══════════════════════════════════════════════════════════════
+
+✓ Always be polite, professional, and attentive
+✓ Confirm orders by repeating items back to customer
+✓ Handle small talk briefly, then guide back to service
+✓ After completing requests, ask "Is there anything else I can help you with?"
+✓ ALWAYS respond with a message (never empty response)
+
+═══════════════════════════════════════════════════════════════
+CONVERSATION FLOW
+═══════════════════════════════════════════════════════════════
+
+1. Greeting → Offer menu or recommendations
+2. Take order → Verify names, call create_order then process_order
+3. Handle modifications → Update order via create_order
+4. When customer signals done → Wait for payment request
+5. Process payment → Thank customer and bid farewell
+
+Remember: Tool results are FACTS. Never contradict them. When tools report problems, help customer solve them - don't pretend they don't exist.
+"""
 )
 
 def get_new_order_id() -> int:
+    """Deprecated: order ids are tracked in LangGraph state now.
+
+    Kept only to avoid breaking external imports; do not use inside this module.
     """
-    Returns a new unique order ID.
-    """
-    global order_counter
-    order_counter += 1
-    return order_counter
+    raise RuntimeError("get_new_order_id is deprecated; use state['order_counter'] inside tools instead.")
 
 
 # -------------------------- LangGraph State Definition -------------------------- #
 class OrderItem(BaseModel):
     """Represents a single item in an order"""
     name: str
-    quantity: int = Field(gt=0)  # Ensure quantity is greater than 0
+    quantity: int = Field(ge=0)  # Allow 0 to support removals in order updates
+    special_instructions: Optional[str] = Field(
+        default=None,
+        description="Optional customer notes (e.g., steak doneness, no ice, allergies).",
+    )
     department: str = ""
     status: Literal["pending", "fulfilled"] = "pending"
 
@@ -370,9 +590,17 @@ class OrderItem(BaseModel):
     @field_validator('quantity')
     @classmethod
     def validate_quantity(cls, value):
-        if not isinstance(value, int) or value <= 0:
-            raise ValueError("Quantity must be a positive integer")
+        if not isinstance(value, int) or value < 0:
+            raise ValueError("Quantity must be a non-negative integer")
         return value
+
+    @field_validator("special_instructions")
+    @classmethod
+    def normalize_special_instructions(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = " ".join(str(value).split()).strip()
+        return value or None
 
 class RestaurantOrderState(TypedDict, total=False):
     """LangGraph state.
@@ -388,13 +616,44 @@ class RestaurantOrderState(TypedDict, total=False):
     summary: str
     conversation_rounds: int
 
+    # Persisted structured facts (per thread_id via checkpointer)
+    customer: Dict[str, Any]
+    orders: Dict[int, Dict[str, Any]]
+    active_order_id: Optional[int]
+    order_counter: int
+    department_stocks: Dict[str, Dict[str, int]]
+
 
 class InputState(TypedDict, total=False):
     messages: List[AnyMessage]
 
 
 class OutputState(TypedDict, total=False):
-    messages: List[AIMessage]
+    messages: List[AnyMessage]
+
+
+def _init_state_node(state: RestaurantOrderState) -> Dict[str, Any]:
+    """Initialize structured state fields once per thread."""
+    updates: Dict[str, Any] = {}
+
+    if "orders" not in state:
+        updates["orders"] = {}
+    if "active_order_id" not in state:
+        updates["active_order_id"] = None
+    if "order_counter" not in state:
+        updates["order_counter"] = 0
+    if "department_stocks" not in state:
+        updates["department_stocks"] = {dept: dict(items) for dept, items in initial_stocks.items()}
+    if "customer" not in state:
+        updates["customer"] = {
+            "name": None,
+            "allergies": [],
+            "dietary_restrictions": [],
+            "preferences": {},
+            "notes": "",
+        }
+
+    return updates
 
 
 # -------------------------- Tools Section -------------------------- #
@@ -402,7 +661,17 @@ class OutputState(TypedDict, total=False):
 
 @tool
 def get_drinks_menu() -> str:
-    """Call this to get the drinks menu."""
+    """Get the complete drinks menu with all available beverages.
+    
+    WHEN TO CALL:
+    - User explicitly requests drinks menu ("show me drinks", "what drinks do you have")
+    - You need to find alternatives when an item is unavailable
+    
+    DO NOT CALL:
+    - If drinks menu already shown in recent conversation (check context first)
+    - For restaurant information (use get_restaurant_info instead)
+    """
+    logger.info("Tool get_drinks_menu called")
     return """
     Drinks Menu:
     - Red Wine
@@ -419,7 +688,20 @@ def get_drinks_menu() -> str:
 
 @tool
 def get_food_menu() -> str:
-    """Call this to get the food menu."""
+    """Get the complete food menu with all available dishes.
+    
+    WHEN TO CALL:
+    - User explicitly requests food menu ("show me the menu", "what food do you have")
+    - You need to find alternatives when an item is unavailable
+    - User asks about options for ambiguous terms (e.g., "steak" → show available steaks)
+    
+    DO NOT CALL:
+    - If food menu already shown in recent conversation (check context first)
+    - For restaurant information (use get_restaurant_info instead)
+    
+    TIP: Always check conversation history before calling. If menu visible, reference it directly.
+    """
+    logger.info("Tool get_food_menu called")
     return """
     Food Menu:
     (Appetizers)
@@ -465,15 +747,58 @@ def get_food_menu() -> str:
 
 @tool
 def get_menu_item_price(item_name: str) -> str:
-    """Call this to get the price of a specific menu item.
-    Returns the price if item exists, or an error message if not found."""
+    """Get the current price of a specific menu item.
+    
+    WHEN TO CALL:
+    - User asks "how much is [item]?" AND you have NO reliable source for the price
+    - No recent menu display (last 5 messages) containing this price
+    - No memory/summary mentioning this specific price
+    - When you need to verify/confirm a price you're uncertain about
+    
+    DO NOT CALL (efficiency optimization):
+    - If full menu with prices just shown in recent conversation (last 5 messages)
+      → Reference that menu directly: "As shown in our menu, [item] is $X"
+    - If your memory/summary contains this price from earlier conversation
+      → Reference memory: "As I mentioned earlier, [item] is $X"
+    - If user asks for complete price list (use get_food_menu/get_drinks_menu instead)
+    
+    CRITICAL RULE:
+    - If NO verifiable source (context or memory) → MUST call this tool
+    - Never guess prices from training data or "typical restaurant prices"
+    
+    NOTE: Final billing (cashier_calculate_total) always uses actual menu prices,
+    so small conversation inaccuracies will be corrected at checkout. But still
+    strive for accuracy to maintain customer trust.
+    
+    Args:
+        item_name: The exact menu item name (e.g., "Filet Mignon", "Black Tea")
+    
+    Returns:
+        Price string if found, or error message if item not in menu
+    """
+    logger.info(f"Tool get_menu_item_price called: item_name={item_name}")
     if item_name in menu_prices:
         return f"{item_name} costs ${menu_prices[item_name]:.2f}"
     return f"Item '{item_name}' not found in menu"
 
 @tool
 def get_restaurant_info() -> str:
-    """Call this to get information about the restaurant, including its history, hours, and accolades."""
+    """Get detailed information about Villa Toscana restaurant.
+    
+    WHEN TO CALL:
+    - User asks about restaurant history, background, or "tell me about this restaurant"
+    - User asks about hours of operation or when restaurant is open
+    - User asks about awards, accolades, or recognition
+    - User asks about the chef, owner, or team
+    
+    DO NOT CALL:
+    - For menu or food/drink information (use menu tools)
+    - For food recommendations (answer from knowledge)
+
+    NOTE:
+    - After calling this tool, do NOT automatically call get_food_menu/get_drinks_menu unless the user explicitly asks.
+    """
+    logger.info("Tool get_restaurant_info called")
     return """
     === VILLA TOSCANA ===
 
@@ -506,9 +831,96 @@ def get_restaurant_info() -> str:
 
     For reservations: +1 (555) 123-4567
     Address: 123 Olive Garden Street, Metropolis, MB 12345
+
+    ---
+    [AGENT NOTE: User asked about restaurant information, NOT the menu. 
+     Do NOT automatically call get_food_menu or get_drinks_menu unless user explicitly requests them.]
     """
 
-def check_and_update_stock(item_name: str, quantity: int) -> str:
+
+@tool
+def update_customer_profile(
+    name: Optional[str] = None,
+    allergies: Optional[List[str]] = None,
+    dietary_restrictions: Optional[List[str]] = None,
+    preferences: Optional[Dict[str, str]] = None,
+    notes: Optional[str] = None,
+    *,
+    state: Annotated[RestaurantOrderState, InjectedState] = None,
+    tool_call_id: Annotated[str, InjectedToolCallId] = "",
+) -> Command:
+    """Persist structured customer facts to graph state (per thread).
+
+    Use this when the user states personal preferences or constraints so the agent can
+    reliably remember them without re-parsing free text.
+    """
+    if not isinstance(state, dict):
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(content="customer_profile_update_failed: missing_state", tool_call_id=tool_call_id)
+                ]
+            }
+        )
+
+    current = state.get("customer")
+    profile: Dict[str, Any] = copy.deepcopy(current) if isinstance(current, dict) else {}
+
+    if isinstance(name, str) and name.strip():
+        profile["name"] = name.strip()
+
+    def _merge_list(key: str, values: Optional[List[str]]) -> None:
+        if not values:
+            return
+        existing = profile.get(key)
+        merged: List[str] = []
+        if isinstance(existing, list):
+            merged.extend([str(v).strip() for v in existing if str(v).strip()])
+        merged.extend([str(v).strip() for v in values if str(v).strip()])
+        # de-dupe while preserving order
+        seen: set[str] = set()
+        deduped: List[str] = []
+        for v in merged:
+            low = v.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            deduped.append(v)
+        profile[key] = deduped
+
+    _merge_list("allergies", allergies)
+    _merge_list("dietary_restrictions", dietary_restrictions)
+
+    if isinstance(preferences, dict) and preferences:
+        existing_prefs = profile.get("preferences")
+        prefs_out: Dict[str, str] = {}
+        if isinstance(existing_prefs, dict):
+            for k, v in existing_prefs.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    prefs_out[k] = v
+        for k, v in preferences.items():
+            if isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip():
+                prefs_out[k.strip()] = v.strip()
+        profile["preferences"] = prefs_out
+
+    if isinstance(notes, str) and notes.strip():
+        existing_notes = profile.get("notes")
+        if isinstance(existing_notes, str) and existing_notes.strip():
+            profile["notes"] = (existing_notes.strip() + " " + notes.strip()).strip()
+        else:
+            profile["notes"] = notes.strip()
+
+    return Command(
+        update={
+            "customer": profile,
+            "messages": [ToolMessage(content="customer_profile_updated", tool_call_id=tool_call_id)],
+        }
+    )
+
+
+def check_and_update_stock(
+    department_stocks: Dict[str, Dict[str, int]], item_name: str, quantity: int
+) -> Dict[str, Any]:
     """
     Check if the specified item is in stock in the relevant department.
     If in stock, decrement the inventory and return 'fulfilled'.
@@ -516,23 +928,54 @@ def check_and_update_stock(item_name: str, quantity: int) -> str:
     If item not found, return 'item_not_found'.
     """
     logger.info(f"Checking stock for item: {item_name}, quantity: {quantity}")
-    for department, items in DEPARTMENT_STOCKS.items():
+    for department, items in department_stocks.items():
         if item_name in items:
-            if items[item_name] >= quantity:
-                items[item_name] -= quantity
+            available_before = int(items[item_name])
+            if available_before >= quantity:
+                items[item_name] = available_before - quantity
                 logger.info(f"Stock fulfilled: {item_name} - {quantity} from {department}")
-                return f"fulfilled in {department}"
-            else:
-                logger.warning(f"Insufficient stock for {item_name} in {department}")
-                return f"insufficient_stock in {department}"
+                return {
+                    "status": "fulfilled",
+                    "department": department,
+                    "requested": quantity,
+                    "available_before": available_before,
+                    "available_after": int(items[item_name]),
+                }
+            logger.warning(
+                f"Insufficient stock for {item_name} in {department}: requested={quantity} available={available_before}"
+            )
+            return {
+                "status": "insufficient_stock",
+                "department": department,
+                "requested": quantity,
+                "available": available_before,
+                "available_before": available_before,
+                "available_after": available_before,
+            }
     logger.error(f"Item not found in any department: {item_name}")
-    return "item_not_found"
+    return {"status": "item_not_found", "requested": quantity}
 
 def _build_summary_prompt(text: str, previous_summary: str) -> List[AnyMessage]:
     summary_instructions = (
         "Summarize the conversation text below.\n"
         "- Focus on concrete details explicitly stated: order items, quantities, preferences, constraints, payment status.\n"
         "- Do NOT invent or infer anything.\n"
+        "\n"
+        "*** ORDER STATUS AUTHORITY RULES (CRITICAL) ***\n"
+        "Order status MUST be determined by the LATEST authoritative tool result in this priority:\n"
+        "\n"
+        "  1. If ORDER_SNAPSHOT is provided below, use its status as the PRIMARY source.\n"
+        "\n"
+        "  2. Tool authority hierarchy (higher overrides lower):\n"
+        "     a) check_payment success (cash_ok/valid) → status = 'paid'\n"
+        "     b) cashier_calculate_total success → status = 'billed'\n"
+        "     c) process_order result → use its 'order_status' field (fulfilled/partially_fulfilled)\n"
+        "     d) create_order result → ONLY use if no process_order ran after it\n"
+        "\n"
+        "  3. NEVER write 'pending' as final status if process_order already ran and returned 'fulfilled' or 'partially_fulfilled'.\n"
+        "\n"
+        "  4. When summarizing order state, prefer ORDER_SNAPSHOT over conversation text.\n"
+        "\n"
         "- Keep it compact and structured.\n"
         "- Return plain text only (no JSON, no list literals).\n"
     )
@@ -547,6 +990,79 @@ def _build_summary_prompt(text: str, previous_summary: str) -> List[AnyMessage]:
         SystemMessage(content=summary_instructions),
         HumanMessage(content=text),
     ]
+
+def _build_state_summary(state: RestaurantOrderState) -> str:
+    """Deterministic, non-hallucinated summary derived from structured state."""
+    lines: List[str] = []
+
+    customer = state.get("customer")
+    if isinstance(customer, dict) and customer:
+        name = customer.get("name")
+        allergies = customer.get("allergies") or []
+        dietary = customer.get("dietary_restrictions") or []
+        notes = customer.get("notes") or ""
+        prefs = customer.get("preferences") or {}
+        lines.append(
+            "Customer profile: "
+            + json.dumps(
+                {
+                    "name": name,
+                    "allergies": allergies,
+                    "dietary_restrictions": dietary,
+                    "preferences": prefs,
+                    "notes": notes,
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    resolved_id = _resolve_order_id_from_state(state, None)
+    orders_state = cast(Dict[int, Dict[str, Any]], state.get("orders", {}))
+    if resolved_id is None or resolved_id not in orders_state:
+        lines.append("Active order: none")
+        return "\n".join(lines).strip()
+
+    order_data = orders_state[resolved_id]
+    status = order_data.get("status")
+    total_cost = order_data.get("total_cost")
+    header = f"Active order: order_id={resolved_id} status={status}"
+    if isinstance(total_cost, (int, float)) and total_cost:
+        header += f" total_cost={float(total_cost):.2f}"
+    lines.append(header)
+
+    items = order_data.get("items") or []
+    if not isinstance(items, list) or not items:
+        lines.append("Items: none")
+        return "\n".join(lines).strip()
+
+    # Aggregate quantities by (status, name, special_instructions)
+    agg: Dict[tuple[str, str, str], int] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        qty = item.get("quantity")
+        item_status = item.get("status")
+        if not isinstance(name, str) or not isinstance(qty, int) or not isinstance(item_status, str):
+            continue
+        notes = _normalize_special_instructions(cast(Optional[str], item.get("special_instructions")))
+        agg[(item_status, name, notes)] = agg.get((item_status, name, notes), 0) + int(qty)
+
+    def _render_bucket(bucket_status: str) -> None:
+        bucket_items = [(k, v) for (k, v) in agg.items() if k[0] == bucket_status]
+        if not bucket_items:
+            return
+        lines.append(f"{bucket_status.title()} items:")
+        for (st, name, notes), qty in sorted(bucket_items, key=lambda x: (x[0][1], x[0][2])):
+            if notes:
+                lines.append(f"- {qty} x {name} ({notes})")
+            else:
+                lines.append(f"- {qty} x {name}")
+
+    _render_bucket("fulfilled")
+    _render_bucket("pending")
+
+    return "\n".join(lines).strip()
 
 
 def _cutoff_index_for_last_n_rounds(messages: List[AnyMessage], *, keep_rounds: int) -> int:
@@ -568,25 +1084,69 @@ def _cutoff_index_for_last_n_rounds(messages: List[AnyMessage], *, keep_rounds: 
 
 
 @tool
-def cashier_calculate_total(order_id: int) -> float:
-    """
-    Calculates the total cost of the entire order (sum of item prices)
-    plus 15% tip. Updates the 'total_cost' field in the order.
-    Returns the total amount.
+def cashier_calculate_total(
+    order_id: int,
+    *,
+    state: Annotated[RestaurantOrderState, InjectedState] = None,
+    tool_call_id: Annotated[str, InjectedToolCallId] = "",
+) -> Command:
+    """Calculate the total bill for an order including 15% tip.
+    
+    WHEN TO CALL:
+    - User explicitly requests the bill: "check please", "can I have the bill"
+    - User asks about total: "how much do I owe?", "what's my total?"
+    - User indicates they're ready to pay: "I'll pay now", "ready to pay"
+    
+    DO NOT CALL:
+    - Before user requests payment
+    - If order is not yet fulfilled (check order status first)
+    
+    This updates order status to 'billed' and calculates: subtotal + 15% tip.
+    
+    Args:
+        order_id: The order ID to calculate total for
+        
+    Returns:
+        Total amount including tip, or error message if order not found
     """
     logger.info(f"Calculating total for order {order_id}")
-    if not orders:
+
+    if not isinstance(state, dict):
+        return Command(
+            update={
+                "messages": [ToolMessage(content="0.0", tool_call_id=tool_call_id)],
+            }
+        )
+
+    orders_state = copy.deepcopy(cast(Dict[int, Dict[str, Any]], state.get("orders", {})))
+    if not orders_state:
         logger.warning("No orders exist in the system")
-        return "create an order first"
+        return Command(
+            update={
+                "messages": [ToolMessage(content="create an order first", tool_call_id=tool_call_id)]
+            }
+        )
 
-    resolved_id = _resolve_order_id(order_id)
-    if resolved_id is None or resolved_id not in orders:
+    resolved_id = _resolve_order_id_from_state(state, order_id)
+    if resolved_id is None or resolved_id not in orders_state:
         logger.error(f"Order {order_id} not found")
-        return 0.0
+        return Command(
+            update={"messages": [ToolMessage(content="0.0", tool_call_id=tool_call_id)]}
+        )
 
-    order_data = orders[resolved_id]
+    order_data = orders_state[resolved_id]
+    # Enforce tool contract: do not bill until everything is fulfilled.
+    if order_data.get("status") != "fulfilled":
+        logger.warning(f"Cannot bill order {resolved_id} with status={order_data.get('status')}")
+        return Command(
+            update={"messages": [ToolMessage(content="order_not_fulfilled", tool_call_id=tool_call_id)]}
+        )
+
     subtotal = 0.0
     for item in order_data["items"]:
+        # Safety: only bill fulfilled items.
+        if item.get("status") != "fulfilled":
+            continue
         name = item["name"]
         qty = item["quantity"]
         price = menu_prices.get(name, 0.0)
@@ -599,93 +1159,198 @@ def cashier_calculate_total(order_id: int) -> float:
     order_data["total_cost"] = total
     order_data["status"] = "billed"
     logger.info(f"Order {resolved_id} total calculated: ${total}")
-    return total
+
+    return Command(
+        update={
+            "orders": orders_state,
+            "messages": [ToolMessage(content=str(total), tool_call_id=tool_call_id)],
+        }
+    )
 
 
 @tool
-def check_payment(amount: float, method: str, order_id: int ) -> str:
-    """
-    Processes the payment.
-    - method = "cash": returns "cash_ok" or "insufficient_funds" if amount < total
-    - method = "card": 80% chance "valid", 20% chance "invalid"
-    If payment is successful, updates order status to "paid".
+def check_payment(
+    amount: float,
+    method: str,
+    order_id: int,
+    *,
+    state: Annotated[RestaurantOrderState, InjectedState] = None,
+    tool_call_id: Annotated[str, InjectedToolCallId] = "",
+) -> Command:
+    """Process customer payment for their order.
+    
+    WHEN TO CALL:
+    - After cashier_calculate_total has been called and total communicated
+    - User provides payment method and amount
+    
+    DO NOT CALL:
+    - Before calculating and showing the total to customer
+    - If order status is not 'billed'
+    
+    Payment methods:
+    - "cash": Validates amount >= total, returns "cash_ok" with change or "insufficient_funds"
+    - "card": Processes card (80% success rate, 20% "invalid" for testing)
+    
+    If payment fails:
+    - Politely ask for alternative payment method
+    - If second failure, offer manager assistance
+    
+    Args:
+        amount: Payment amount provided by customer
+        method: Payment method ("cash" or "card")
+        order_id: The order ID to process payment for
+        
+    Returns:
+        Payment status: "cash_ok", "insufficient_funds", "valid", "invalid", or error
     """
     logger.info(f"Processing payment: ${amount} via {method} for order {order_id}")
-    resolved_id = _resolve_order_id(order_id)
-    if resolved_id is None or resolved_id not in orders:
-        logger.error(f"Order {order_id} not found during payment")
-        return "order_not_found"
 
-    order_data = orders[resolved_id]
-    total_due = order_data.get("total_cost", 0.0)
+    if not isinstance(state, dict):
+        return Command(update={"messages": [ToolMessage(content="order_not_found", tool_call_id=tool_call_id)]})
+
+    orders_state = copy.deepcopy(cast(Dict[int, Dict[str, Any]], state.get("orders", {})))
+    resolved_id = _resolve_order_id_from_state(state, order_id)
+    if resolved_id is None or resolved_id not in orders_state:
+        logger.error(f"Order {order_id} not found during payment")
+        return Command(update={"messages": [ToolMessage(content="order_not_found", tool_call_id=tool_call_id)]})
+
+    order_data = orders_state[resolved_id]
+
+    # Ensure we have a billed total to pay against.
+    total_due = float(order_data.get("total_cost") or 0.0)
     if total_due <= 0:
-        total_due = cashier_calculate_total(resolved_id)
+        subtotal = 0.0
+        for item in order_data.get("items", []):
+            name = item.get("name")
+            qty = item.get("quantity")
+            if isinstance(name, str) and isinstance(qty, int):
+                subtotal += float(menu_prices.get(name, 0.0)) * float(qty)
+        total_due = round(subtotal * 1.15, 2)
+        order_data["total_cost"] = total_due
+        order_data["status"] = "billed"
+
+    result: str
+    active_update: Optional[int] = cast(Optional[int], state.get("active_order_id"))
 
     if method.lower() == "cash":
         if amount < total_due:
             logger.warning(f"Insufficient cash payment: ${amount} < ${total_due}")
-            return "insufficient_funds"
-        # Payment success; calculate change
-        change = round(amount - total_due, 2)
-        order_data["status"] = "paid"
-        _set_active_order_id(None)
-        logger.info(f"Cash payment successful for order {resolved_id}. Change: ${change}")
-        return f"cash_ok with change {change}"
+            result = "insufficient_funds"
+        else:
+            change = round(float(amount) - float(total_due), 2)
+            order_data["status"] = "paid"
+            active_update = None
+            logger.info(f"Cash payment successful for order {resolved_id}. Change: ${change}")
+            result = f"cash_ok with change {change}"
 
     elif method.lower() == "card":
-        # 80% success
         if random.random() < 0.8:
             order_data["status"] = "paid"
-            _set_active_order_id(None)
+            active_update = None
             logger.info(f"Card payment successful for order {resolved_id}")
-            return "valid"
+            result = "valid"
         else:
             logger.warning(f"Card payment failed for order {resolved_id}")
-            return "invalid"
+            result = "invalid"
 
     else:
         logger.error(f"Unknown payment method: {method}")
-        return "unknown_method"
+        result = "unknown_method"
+
+    update: Dict[str, Any] = {
+        "orders": orders_state,
+        "messages": [ToolMessage(content=result, tool_call_id=tool_call_id)],
+    }
+    if active_update != cast(Optional[int], state.get("active_order_id")):
+        update["active_order_id"] = active_update
+
+    return Command(update=update)
 
 
-class CreateOrderInput(BaseModel):
-    order_items: List[OrderItem]
-
-
-@tool(args_schema=CreateOrderInput)
-def create_order(order_items: List[OrderItem]) -> str:
-    """
-    Creates or updates the active order with status 'pending', given a list of order items in JSON format,
-    for example:
+@tool
+def create_order(
+    order_items: List[OrderItem],
+    *,
+    state: Annotated[RestaurantOrderState, InjectedState] = None,
+    tool_call_id: Annotated[str, InjectedToolCallId] = "",
+) -> Command:
+    """Create a new order or update the active order with customer's items.
+    
+    WHEN TO CALL:
+    - User confirms items they want to order
+    - User modifies existing order (add/remove/change items)
+    
+    BEFORE CALLING:
+    - Verify all item names match exact menu names (e.g., "steak" → clarify which: Filet Mignon or Ribeye Steak)
+    - Convert colloquial terms: "iced tea" → "Black Tea", "coffee" → specific type
+    
+    AFTER CALLING:
+    - Check the returned order status
+    - If order created/updated, proceed to call process_order to fulfill it
+    
+    Format:
     [
         {"name": "Bruschetta", "quantity": 2},
-        {"name": "Lobster Tail", "quantity": 1}
+        {"name": "Lobster Tail", "quantity": 1, "special_instructions": "no butter"}
     ]
-    Returns the newly created or updated order ID.
+
+    Quantity semantics:
+    - quantity > 0: add items to the active order (or adjust totals in certain update scenarios)
+    - quantity == 0: remove that item (by name + special_instructions) from the active order
+    
+    Args:
+        order_items: List of items with name, quantity, and optional special_instructions
+        
+    Returns:
+        Message with order ID and status (e.g., "Order 123 created with status 'pending'")
     """
     try:
-        global orders
+        if not isinstance(state, dict):
+            msg = "Error creating order: missing_state"
+            return Command(update={"messages": [ToolMessage(content=msg, tool_call_id=tool_call_id)]})
+
+        orders_state = copy.deepcopy(cast(Dict[int, Dict[str, Any]], state.get("orders", {})))
+        stocks_state = copy.deepcopy(cast(Dict[str, Dict[str, int]], state.get("department_stocks", {})))
+        order_counter_state = int(state.get("order_counter", 0))
+
         incoming_quantities = _normalize_order_items(order_items)
-        active_id = _get_active_order_id()
-        if active_id is None:
+        incoming_names = {name for (name, _) in incoming_quantities.keys()}
+        incoming_keys = set(incoming_quantities.keys())
+
+        active_id = _get_active_order_id_from_state(state)
+        if active_id is None or active_id not in orders_state:
             logger.info(f"Creating new order with items: {order_items}")
-            order_id = get_new_order_id()
-            _set_active_order_id(order_id)
-            orders[order_id] = {
+            order_id = order_counter_state + 1
+            orders_state[order_id] = {
                 "items": [
-                    {"name": name, "quantity": qty, "department": "", "status": "pending"}
-                    for name, qty in incoming_quantities.items()
+                    {
+                        "name": name,
+                        "quantity": qty,
+                        "special_instructions": special_instructions or "",
+                        "department": "",
+                        "status": "pending",
+                    }
+                    for (name, special_instructions), qty in incoming_quantities.items()
+                    if int(qty) > 0
                 ],
                 "status": "pending",
                 "total_cost": 0.0,
             }
             logger.info(f"Order {order_id} created successfully")
-            return f"New order {order_id} created with status 'pending'."
+            msg = f"New order {order_id} created with status 'pending'."
+            return Command(
+                update={
+                    "orders": orders_state,
+                    "active_order_id": order_id,
+                    "order_counter": order_id,
+                    "department_stocks": stocks_state,
+                    "messages": [ToolMessage(content=msg, tool_call_id=tool_call_id)],
+                }
+            )
 
-        order_data = orders[active_id]
+        order_data = orders_state[active_id]
         existing_items = order_data.get("items", [])
         existing_names = {item["name"] for item in existing_items}
-        incoming_names = set(incoming_quantities.keys())
         overlap_ratio = 0.0
         if existing_names:
             overlap_ratio = len(existing_names & incoming_names) / len(existing_names)
@@ -694,30 +1359,171 @@ def create_order(order_items: List[OrderItem]) -> str:
 
         if not snapshot_mode:
             new_items = list(existing_items)
-            for name, qty in incoming_quantities.items():
+            # Heuristic for modification requests like "make that two instead of one":
+            # If the caller supplies exactly one item that already exists in the order,
+            # interpret the provided quantity as the desired TOTAL for that item (not an additive delta).
+            single_set_key: Optional[tuple[str, str]] = None
+            single_set_qty: int = 0
+            if len(incoming_quantities) == 1:
+                (only_key, desired_qty) = next(iter(incoming_quantities.items()))
+                only_name, only_instructions = only_key
+                only_key_norm = _order_item_key(only_name, only_instructions)
+                if any(
+                    (
+                        item.get("name") == only_name
+                        and _order_item_key(
+                            cast(str, item.get("name")),
+                            cast(Optional[str], item.get("special_instructions")),
+                        )
+                        == only_key_norm
+                    )
+                    for item in existing_items
+                ):
+                    single_set_key = only_key_norm
+                    single_set_qty = int(desired_qty)
+
+            for (name, special_instructions), qty in incoming_quantities.items():
+                key_norm = _order_item_key(name, special_instructions)
+                if single_set_key is not None and key_norm == single_set_key:
+                    matching_entries = [
+                        item
+                        for item in new_items
+                        if item.get("name") == name
+                        and _order_item_key(
+                            cast(str, item.get("name")),
+                            cast(Optional[str], item.get("special_instructions")),
+                        )
+                        == key_norm
+                    ]
+                    current_total = sum(int(item.get("quantity", 0)) for item in matching_entries)
+                    raw_qty = int(single_set_qty)
+                    # Try to tolerate both common calling conventions:
+                    # - absolute: quantity == desired total
+                    # - delta: quantity == amount to add (often "1 more")
+                    if raw_qty == 0:
+                        desired_total = 0
+                    elif raw_qty == 1 and current_total > 0:
+                        desired_total = current_total + 1
+                    else:
+                        desired_total = raw_qty
+
+                    if desired_total > current_total:
+                        delta = desired_total - current_total
+                        if delta > 0:
+                            new_items.append(
+                                {
+                                    "name": name,
+                                    "quantity": delta,
+                                    "special_instructions": special_instructions or "",
+                                    "department": "",
+                                    "status": "pending",
+                                }
+                            )
+                        continue
+
+                    remaining_to_remove = current_total - desired_total
+                    if remaining_to_remove <= 0:
+                        continue
+
+                    adjusted_entries: List[Dict[str, object]] = []
+                    # Remove pending first, then fulfilled (restocking any fulfilled quantities).
+                    for entry in sorted(
+                        matching_entries, key=lambda e: 0 if e.get("status") == "pending" else 1
+                    ):
+                        if remaining_to_remove <= 0:
+                            adjusted_entries.append(entry)
+                            continue
+                        entry_qty = int(entry.get("quantity", 0))
+                        if entry_qty <= remaining_to_remove:
+                            if entry.get("status") == "fulfilled":
+                                _restock_item_in_stocks(
+                                    stocks_state,
+                                    name,
+                                    int(entry_qty),
+                                    cast(str, entry.get("department", "")),
+                                )
+                            remaining_to_remove -= entry_qty
+                            continue
+                        if entry.get("status") == "fulfilled":
+                            _restock_item_in_stocks(
+                                stocks_state,
+                                name,
+                                int(remaining_to_remove),
+                                cast(str, entry.get("department", "")),
+                            )
+                        updated_entry = dict(entry)
+                        updated_entry["quantity"] = entry_qty - int(remaining_to_remove)
+                        remaining_to_remove = 0
+                        adjusted_entries.append(updated_entry)
+
+                    # Replace all entries for this key with adjusted ones (keep other items unchanged).
+                    new_items = [
+                        item
+                        for item in new_items
+                        if not (
+                            item.get("name") == name
+                            and _order_item_key(
+                                cast(str, item.get("name")),
+                                cast(Optional[str], item.get("special_instructions")),
+                            )
+                            == key_norm
+                        )
+                    ] + adjusted_entries
+                    continue
+
+                if qty <= 0:
+                    # For non-existent items, treat quantity==0 as a no-op in incremental mode.
+                    continue
                 pending_entry = next(
-                    (item for item in new_items if item["name"] == name and item["status"] == "pending"),
+                    (
+                        item
+                        for item in new_items
+                        if item["name"] == name
+                        and _normalize_special_instructions(
+                            cast(Optional[str], item.get("special_instructions"))
+                        )
+                        == _normalize_special_instructions(special_instructions)
+                        and item["status"] == "pending"
+                    ),
                     None,
                 )
                 if pending_entry:
                     pending_entry["quantity"] += qty
                 else:
                     new_items.append(
-                        {"name": name, "quantity": qty, "department": "", "status": "pending"}
+                        {
+                            "name": name,
+                            "quantity": qty,
+                            "special_instructions": special_instructions or "",
+                            "department": "",
+                            "status": "pending",
+                        }
                     )
             order_data["items"] = new_items
         else:
-            existing_by_name: Dict[str, List[Dict[str, object]]] = {}
+            existing_by_key: Dict[tuple[str, str], List[Dict[str, object]]] = {}
             for item in existing_items:
-                existing_by_name.setdefault(item["name"], []).append(item)
+                key = _order_item_key(
+                    cast(str, item["name"]), cast(Optional[str], item.get("special_instructions"))
+                )
+                existing_by_key.setdefault(key, []).append(item)
 
             new_items: List[Dict[str, object]] = []
-            for name, desired_qty in incoming_quantities.items():
-                current_entries = existing_by_name.get(name, [])
+            for (name, special_instructions), desired_qty in incoming_quantities.items():
+                key = _order_item_key(name, special_instructions)
+                current_entries = existing_by_key.get(key, [])
                 current_total = sum(item["quantity"] for item in current_entries)
                 if not current_entries:
+                    if desired_qty <= 0:
+                        continue
                     new_items.append(
-                        {"name": name, "quantity": desired_qty, "department": "", "status": "pending"}
+                        {
+                            "name": name,
+                            "quantity": desired_qty,
+                            "special_instructions": special_instructions or "",
+                            "department": "",
+                            "status": "pending",
+                        }
                     )
                     continue
                 if desired_qty >= current_total:
@@ -725,7 +1531,13 @@ def create_order(order_items: List[OrderItem]) -> str:
                     delta = desired_qty - current_total
                     if delta > 0:
                         new_items.append(
-                            {"name": name, "quantity": delta, "department": "", "status": "pending"}
+                            {
+                                "name": name,
+                                "quantity": delta,
+                                "special_instructions": special_instructions or "",
+                                "department": "",
+                                "status": "pending",
+                            }
                         )
                     continue
 
@@ -740,22 +1552,31 @@ def create_order(order_items: List[OrderItem]) -> str:
                     entry_qty = entry["quantity"]
                     if entry_qty <= remaining_to_remove:
                         if entry["status"] == "fulfilled":
-                            _restock_item(name, entry_qty, cast(str, entry.get("department", "")))
+                            _restock_item_in_stocks(
+                                stocks_state, name, int(entry_qty), cast(str, entry.get("department", ""))
+                            )
                         remaining_to_remove -= entry_qty
                         continue
                     if entry["status"] == "fulfilled":
-                        _restock_item(name, remaining_to_remove, cast(str, entry.get("department", "")))
+                        _restock_item_in_stocks(
+                            stocks_state, name, int(remaining_to_remove), cast(str, entry.get("department", ""))
+                        )
                     updated_entry = dict(entry)
                     updated_entry["quantity"] = entry_qty - remaining_to_remove
                     remaining_to_remove = 0
                     adjusted_entries.append(updated_entry)
                 new_items.extend(adjusted_entries)
 
-            removed_names = existing_names - incoming_names
-            for name in removed_names:
-                for entry in existing_by_name.get(name, []):
+            removed_keys = set(existing_by_key.keys()) - incoming_keys
+            for removed_name, removed_instructions in removed_keys:
+                for entry in existing_by_key.get((removed_name, removed_instructions), []):
                     if entry["status"] == "fulfilled":
-                        _restock_item(name, entry["quantity"], cast(str, entry.get("department", "")))
+                        _restock_item_in_stocks(
+                            stocks_state,
+                            cast(str, entry["name"]),
+                            cast(int, entry["quantity"]),
+                            cast(str, entry.get("department", "")),
+                        )
 
             order_data["items"] = new_items
 
@@ -770,62 +1591,159 @@ def create_order(order_items: List[OrderItem]) -> str:
         else:
             order_data["status"] = "pending"
 
-        return f"Order {active_id} updated with status '{order_data['status']}'."
+        msg = f"Order {active_id} updated with status '{order_data['status']}'."
+        return Command(
+            update={
+                "orders": orders_state,
+                "department_stocks": stocks_state,
+                "messages": [ToolMessage(content=msg, tool_call_id=tool_call_id)],
+            }
+        )
 
     except ValidationError as e:
         logger.error(f"Order validation error: {str(e)}")
-        return f"Error creating order: {str(e)}"
+        msg = f"Error creating order: {str(e)}"
+        return Command(update={"messages": [ToolMessage(content=msg, tool_call_id=tool_call_id)]})
 
 
 @tool
-def process_order(order_id: int) -> str:
+def process_order(
+    order_id: int,
+    *,
+    state: Annotated[RestaurantOrderState, InjectedState] = None,
+    tool_call_id: Annotated[str, InjectedToolCallId] = "",
+) -> Command:
+    """Process an order by checking inventory and fulfilling items.
+    
+    WHEN TO CALL:
+    - Immediately after create_order when order status is 'pending'
+    - After create_order when order status is 'partially_fulfilled' (to retry pending items)
+    
+    BEFORE CALLING:
+    - CHECK the current order status from previous create_order result
+    - Verify status is 'pending' OR 'partially_fulfilled'
+    
+    DO NOT CALL:
+    - If order status is 'fulfilled' (already done)
+    - If order status is 'billed' or 'paid' (order complete)
+    
+    AFTER CALLING - CRITICAL:
+    - READ the complete tool response JSON
+    - If "ok": false → Explain the error, don't claim success
+    - If "status": "insufficient_stock" → Tell customer exact available quantity, offer alternatives
+    - If "status": "partially_fulfilled" → Explain which items succeeded and which failed
+    - NEVER say items are "added" or "ordered" if tool reports insufficient stock
+    
+    Args:
+        order_id: The order ID to process
+        
+    Returns:
+        JSON with order status and per-item stock check results
     """
-    Processes an existing order:
-    1. Checks each item's department stock via check_and_update_stock.
-    2. If insufficient stock for any item, that item remains pending,
-       and the overall order might be partially_fulfilled.
-    3. If all items fulfilled, order is marked 'fulfilled'.
-    """
-    global orders # Still using global orders for simplicity
     logger.info(f"Processing order {order_id}")
-    resolved_id = _resolve_order_id(order_id)
-    if resolved_id is None or resolved_id not in orders:
-        logger.error(f"Order {order_id} not found")
-        return "order_not_found"
 
-    order_data = orders[resolved_id]
+    if not isinstance(state, dict):
+        payload = json.dumps(
+            {"tool": "process_order", "ok": False, "error": "missing_state", "order_id": order_id},
+            ensure_ascii=False,
+        )
+        return Command(update={"messages": [ToolMessage(content=payload, tool_call_id=tool_call_id)]})
+
+    orders_state = copy.deepcopy(cast(Dict[int, Dict[str, Any]], state.get("orders", {})))
+    stocks_state = copy.deepcopy(cast(Dict[str, Dict[str, int]], state.get("department_stocks", {})))
+
+    resolved_id = _resolve_order_id_from_state(state, order_id)
+    if resolved_id is None or resolved_id not in orders_state:
+        logger.error(f"Order {order_id} not found")
+        payload = json.dumps(
+            {"tool": "process_order", "ok": False, "error": "order_not_found", "order_id": order_id},
+            ensure_ascii=False,
+        )
+        return Command(update={"messages": [ToolMessage(content=payload, tool_call_id=tool_call_id)]})
+
+    order_data = orders_state[resolved_id]
     logger.info(f"Order {resolved_id} status: {order_data['status']}")
     if order_data["status"] not in ["pending", "partially_fulfilled"]:
         logger.warning(f"Cannot process order {resolved_id} in state: {order_data['status']}")
-        return f"cannot_process_order_in_state_{order_data['status']}"
+        payload = json.dumps(
+            {
+                "tool": "process_order",
+                "ok": False,
+                "error": f"cannot_process_order_in_state_{order_data['status']}",
+                "order_id": resolved_id,
+                "order_status": order_data["status"],
+            },
+            ensure_ascii=False,
+        )
+        return Command(update={"messages": [ToolMessage(content=payload, tool_call_id=tool_call_id)]})
 
     all_fulfilled = True
+    items_result: List[Dict[str, Any]] = []
     for item in order_data["items"]:
         if item["status"] == "pending":
             # call tool check_and_update_stock item_name, quantity
             logger.info(f"Checking stock for {item['name']} x{item['quantity']} in process_order")
-            result = check_and_update_stock(item["name"], item["quantity"])
+            result = check_and_update_stock(stocks_state, cast(str, item["name"]), cast(int, item["quantity"]))
             logger.info(f"Stock check result for {item['name']}: {result} in process_order")
-            if "fulfilled" in result:
+            if result.get("status") == "fulfilled":
                 # Mark item fulfilled; record department
-                dept = result.split(" in ")[-1]
+                dept = cast(str, result.get("department", ""))
                 item["department"] = dept
                 item["status"] = "fulfilled"
-            elif "insufficient_stock" in result:
+            elif result.get("status") == "insufficient_stock":
                 all_fulfilled = False
             else:
                 # item not found or another error
                 all_fulfilled = False
+            items_result.append(
+                {
+                    "name": item.get("name"),
+                    "quantity": item.get("quantity"),
+                    "special_instructions": item.get("special_instructions") or "",
+                    "department": item.get("department") or "",
+                    "item_status": item.get("status"),
+                    "stock": result,
+                }
+            )
+            continue
+
+        items_result.append(
+            {
+                "name": item.get("name"),
+                "quantity": item.get("quantity"),
+                "special_instructions": item.get("special_instructions") or "",
+                "department": item.get("department") or "",
+                "item_status": item.get("status"),
+                "stock": None,
+            }
+        )
 
     if all_fulfilled:
-        order_data["status"] = "fulfilled" # Updating global orders
+        order_data["status"] = "fulfilled"
         logger.info(f"Order {resolved_id} fully fulfilled")
-        return f"Order {resolved_id} is fully fulfilled."
     else:
         # If at least one item remains "pending", the order is partially fulfilled
-        order_data["status"] = "partially_fulfilled" # Updating global orders
+        order_data["status"] = "partially_fulfilled"
         logger.warning(f"Order {resolved_id} partially fulfilled")
-        return f"Order {resolved_id} is partially fulfilled. Some items are not available or still pending."
+
+    payload = json.dumps(
+        {
+            "tool": "process_order",
+            "ok": True,
+            "order_id": resolved_id,
+            "order_status": order_data["status"],
+            "items": items_result,
+        },
+        ensure_ascii=False,
+    )
+
+    return Command(
+        update={
+            "orders": orders_state,
+            "department_stocks": stocks_state,
+            "messages": [ToolMessage(content=payload, tool_call_id=tool_call_id)],
+        }
+    )
 
 
 # -------------------------- LLM and Workflow Initialization -------------------------- #
@@ -844,7 +1762,6 @@ def _build_llm():
     gemini_model = (
         os.getenv("GEMINI_MODEL_FLASH30")
         or os.getenv("GEMINI_MODEL_FLASH20")
-        or os.getenv("GEMINI_MODEL_FLASH15")
     )
     if gemini_api_key and gemini_model:
         logger.info(f"Using Gemini model: {gemini_model}")
@@ -906,6 +1823,7 @@ def _build_llm():
 tools = [
     get_drinks_menu,
     get_food_menu,
+    update_customer_profile,
     create_order,
     process_order,
     cashier_calculate_total,
@@ -927,11 +1845,6 @@ def _agent_node(state: RestaurantOrderState) -> Dict:
 
     if messages and isinstance(messages[-1], HumanMessage):
         conversation_rounds += 1
-        price_item = _extract_menu_item_for_price_question(messages[-1].content)
-        if price_item:
-            price_text = get_menu_item_price.invoke({"item_name": price_item})
-            response_text = f"{price_text} Would you like anything else?"
-            return {"messages": [AIMessage(content=response_text)], "conversation_rounds": conversation_rounds}
 
     # Some providers (notably Gemini) reject requests with no "contents". If we have no
     # user/assistant history yet, don't call the model—return a deterministic greeting.
@@ -953,6 +1866,33 @@ def _agent_node(state: RestaurantOrderState) -> Dict:
     model_messages: List[AnyMessage] = [system_message]
     if summary:
         model_messages.append(SystemMessage(content=f"Conversation summary so far:\n{summary}"))
+
+    # Inject structured, authoritative facts (so the model doesn't have to re-parse free text).
+    customer = state.get("customer")
+    if isinstance(customer, dict) and customer:
+        model_messages.append(
+            SystemMessage(
+                content="Customer profile (structured, authoritative):\n"
+                + json.dumps(customer, ensure_ascii=False)
+            )
+        )
+
+    resolved_id = _resolve_order_id_from_state(state, None)
+    orders_state = cast(Dict[int, Dict[str, Any]], state.get("orders", {}))
+    if resolved_id is not None and resolved_id in orders_state:
+        order_data = orders_state[resolved_id]
+        order_snapshot = {
+            "order_id": resolved_id,
+            "status": order_data.get("status"),
+            "total_cost": order_data.get("total_cost"),
+            "items": order_data.get("items"),
+        }
+        model_messages.append(
+            SystemMessage(
+                content="Current active order (structured, authoritative):\n"
+                + json.dumps(order_snapshot, ensure_ascii=False)
+            )
+        )
 
     # Also trim *input* to the model (independent of persisted state pruning).
     # Use message-count trimming to avoid accidental token overflow while keeping structure valid.
@@ -1007,18 +1947,11 @@ def _postprocess_node(state: RestaurantOrderState) -> Dict:
         if m.id is not None:
             deletions.append(RemoveMessage(id=m.id))
 
-    # Summarize ONLY the portion we're removing.
-    # Exclude raw tool payload verbosity but keep meaning by stringifying the messages.
-    text = get_buffer_string(to_summarize, human_prefix="User", ai_prefix="Waiter")
-    summary_prompt = _build_summary_prompt(text=text, previous_summary=previous_summary)
+    # Summary should be accurate and non-hallucinated: derive it from structured state.
     try:
-        if model_with_tools is None:
-            raise RuntimeError("LLM is not initialized. Start the script via __main__.")
-        # Tool-bound chat models still support invoke() for normal messages.
-        raw_summary = model_with_tools.invoke(summary_prompt).content
-        new_summary = _render_ai_content(raw_summary).strip()
+        new_summary = _build_state_summary(state)
     except Exception as e:
-        logger.error(f"Summary generation failed: {str(e)}", exc_info=True)
+        logger.error(f"State summary generation failed: {str(e)}", exc_info=True)
         new_summary = previous_summary  # best effort; still prune
 
     # Reset rounds to the kept window size (or less if conversation is shorter).
@@ -1034,11 +1967,13 @@ def _postprocess_node(state: RestaurantOrderState) -> Dict:
 # Build the state graph
 workflow = StateGraph(RestaurantOrderState, input_schema=InputState, output_schema=OutputState)
 memory=MemorySaver()
+workflow.add_node("init", _init_state_node)
 workflow.add_node("agent", _agent_node)
 workflow.add_node("tools", tool_node)
 workflow.add_node("postprocess", _postprocess_node)
 
-workflow.add_edge(START, "agent")
+workflow.add_edge(START, "init")
+workflow.add_edge("init", "agent")
 
 def _route_after_agent(state: RestaurantOrderState) -> str:
     msgs = cast(List[AnyMessage], state.get("messages", []))
@@ -1057,7 +1992,59 @@ workflow.add_edge("postprocess", END)
 app = workflow.compile(checkpointer=memory)
 config = {"configurable": {"thread_id": "1"}}
 
-# Initial system message
+def _reset_simulation_state() -> None:
+    """Deprecated.
+
+    This module now stores orders/stocks in LangGraph state (per thread_id), not globals.
+    Kept only because golden-dataset runner calls it.
+    """
+    return None
+
+
+def _load_golden_dataset_entries(dataset_path: Path) -> List[Dict[str, Any]]:
+    """Load the golden dataset JSON array and return usable dict entries."""
+    raw = dataset_path.read_text(encoding="utf-8")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, list):
+        raise ValueError(f"Golden dataset must be a JSON array: {dataset_path}")
+    entries: List[Dict[str, Any]] = []
+    for item in parsed:
+        if isinstance(item, dict) and isinstance(item.get("user_query"), str):
+            entries.append(item)
+    return entries
+
+
+def _run_golden_dataset(dataset_path: Path) -> None:
+    """Auto-run golden dataset queries through the agent graph for smoke testing."""
+    if model_with_tools is None:
+        raise RuntimeError("LLM is not initialized. Start the script via __main__.")
+
+    entries = _load_golden_dataset_entries(dataset_path)
+    if not entries:
+        logger.warning(f"Golden dataset has no usable entries: {dataset_path}")
+        return
+
+    dataset_config = {"configurable": {"thread_id": "golden-dataset"}}
+    print(f"\n[golden] Running {len(entries)} dataset queries from: {dataset_path.name}\n")
+    logger.info(f"Golden dataset run start: {dataset_path} entries={len(entries)}")
+
+    for fallback_idx, entry in enumerate(entries, 1):
+        case_id = entry.get("id", fallback_idx)
+        user_query = cast(str, entry["user_query"])
+
+        logger.info(f"[golden #{case_id}] User query: {user_query}")
+        print(f"[golden #{case_id}] You: {user_query}")
+
+        user_message = HumanMessage(content=user_query, name="user")
+        result = app.invoke({"messages": [user_message]}, config=dataset_config)
+        ai_messages = [msg for msg in result.get("messages", []) if isinstance(msg, AIMessage)]
+        rendered = _render_ai_content(ai_messages[-1].content) if ai_messages else "<no response>"
+
+        print(f"[golden #{case_id}] Waiter: {rendered}\n")
+        logger.info(f"[golden #{case_id}] AI response: {rendered}")
+
+    logger.info("Golden dataset run complete")
+    print("[golden] Done.\n")
 
 if __name__ == "__main__":
     logger.info("Starting restaurant waiter service with custom state")
@@ -1067,6 +2054,19 @@ if __name__ == "__main__":
         # Initialize model at runtime so missing env-vars don't print a full traceback on import.
         llm = _build_llm()
         model_with_tools = llm.bind_tools(tools)
+
+        # Auto-run golden dataset on startup (if present) to smoke-test the agent framework.
+        dataset_path = Path(__file__).with_name("waiter_agent_accessment_golden_dataset.json")
+        if dataset_path.exists():
+            try:
+                _reset_simulation_state()
+                _run_golden_dataset(dataset_path)
+            except Exception as e:
+                logger.error(f"Golden dataset run failed: {str(e)}", exc_info=True)
+                print(f"[golden] Failed to run dataset: {e}")
+            finally:
+                # Ensure interactive mode starts from a clean slate.
+                _reset_simulation_state()
 
         while True:
             user_input = input("\nYou: ")
