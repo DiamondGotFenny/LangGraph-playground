@@ -7,6 +7,37 @@ This script demonstrates an LLM-powered restaurant waiter with a custom LangGrap
 4. Billing and payment (with a 15% tip, random 20% chance of invalid credit card).
 5. Graceful error handling and request for alternate payment method if necessary.
 
+运行说明（可直接复制粘贴）
+
+1) 默认自动选择（优先级：Gemini -> DeepSeek -> NVIDIA）
+
+    python waiter_react_agent.py
+
+2) 直接用 `-model` 选择具体模型/别名（你要的简化形式）
+
+可选值（全部列出，直接复制即可用）：
+
+Gemini：
+
+    python waiter_react_agent.py -model "gemini-3-flash-preview"   # 对应 .env: GEMINI_MODEL_FLASH30
+    python waiter_react_agent.py -model "gemini-3-pro-preview"     # 对应 .env: GEMINI_MODEL_PRO3
+
+DeepSeek：
+
+    python waiter_react_agent.py -model "deepseek-chat"            # 对应 .env: DEEPSEEK_MODEL
+
+NVIDIA（OpenAI兼容接口）：
+
+    python waiter_react_agent.py -model kimi                       # moonshotai/kimi-k2-thinking
+    python waiter_react_agent.py -model minimax                     # minimaxai/minimax-m2
+    python waiter_react_agent.py -model qwen                        # qwen/qwen3-next-80b-a3b-instruct
+
+说明：本脚本会在运行时自动读取 `.env`（如果存在）以及系统环境变量，无需在命令行里手动 `$env:...`。
+
+帮助：
+
+    python waiter_react_agent.py -h
+
 Requirements:
 - python-dotenv for reading environment variables from a .env file (optional).
 - The "langchain_core" and "langgraph" modules in your environment,
@@ -15,12 +46,14 @@ Requirements:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import random
 import re
 import copy
 from pathlib import Path
+from dataclasses import dataclass, field
 
 # Optional .env loading for local development convenience.
 # If python-dotenv isn't installed or .env isn't present, we fall back to OS env vars.
@@ -36,7 +69,7 @@ from typing import Any, List, Dict, Optional, Literal, TypedDict, cast
 from typing_extensions import Annotated
 from langchain_core.tools import tool
 from langchain_core.tools import InjectedToolCallId
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import (
     AIMessage,
@@ -71,6 +104,293 @@ def ensure_log_file(log_file_path: str) -> str:
 # Setup logger with guaranteed log file
 log_file_path = ensure_log_file("waiter_react_agent.log")
 logger = setup_logger(log_file_path, log_to_console=False)
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        # bool is a subclass of int; treat it as invalid here.
+        if isinstance(value, bool):
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _find_first_usage_dict(obj: Any) -> Optional[Dict[str, Any]]:
+    """Best-effort search for an OpenAI/DeepSeek-like `usage` dict in nested metadata."""
+    if isinstance(obj, dict):
+        for key in ("usage", "token_usage"):
+            maybe = obj.get(key)
+            if isinstance(maybe, dict):
+                return maybe
+        for v in obj.values():
+            found = _find_first_usage_dict(v)
+            if found is not None:
+                return found
+        return None
+    if isinstance(obj, list):
+        for v in obj:
+            found = _find_first_usage_dict(v)
+            if found is not None:
+                return found
+        return None
+    return None
+
+
+def _extract_llm_token_usage(msg: Any) -> Optional[Dict[str, int]]:
+    """Extract {prompt_tokens, completion_tokens, total_tokens, ...} from an AIMessage.
+
+    DeepSeek returns OpenAI-compatible chat.completion payloads, e.g.:
+      {"usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int, ...}}
+
+    LangChain providers may expose the same info via:
+    - AIMessage.usage_metadata (input/output/total)
+    - AIMessage.response_metadata["token_usage"] / ["usage"]
+    - nested dicts in model_dump()
+    """
+    if not isinstance(msg, AIMessage):
+        return None
+
+    # 1) LangChain canonical usage_metadata (newer providers).
+    usage_md = getattr(msg, "usage_metadata", None)
+    if isinstance(usage_md, dict):
+        input_tokens = _coerce_int(usage_md.get("input_tokens"))
+        output_tokens = _coerce_int(usage_md.get("output_tokens"))
+        total_tokens = _coerce_int(usage_md.get("total_tokens"))
+        if input_tokens is not None or output_tokens is not None or total_tokens is not None:
+            usage_out: Dict[str, int] = {}
+            if input_tokens is not None:
+                usage_out["prompt_tokens"] = input_tokens
+            if output_tokens is not None:
+                usage_out["completion_tokens"] = output_tokens
+            if total_tokens is not None:
+                usage_out["total_tokens"] = total_tokens
+            # Fill total if missing but we have both parts.
+            if "total_tokens" not in usage_out and "prompt_tokens" in usage_out and "completion_tokens" in usage_out:
+                usage_out["total_tokens"] = int(usage_out["prompt_tokens"]) + int(usage_out["completion_tokens"])
+            return usage_out if usage_out else None
+
+    # 2) Common OpenAI-compatible shapes.
+    for container in (
+        getattr(msg, "response_metadata", None),
+        getattr(msg, "additional_kwargs", None),
+    ):
+        if isinstance(container, dict):
+            usage = container.get("usage")
+            if isinstance(usage, dict):
+                break
+            usage = container.get("token_usage")
+            if isinstance(usage, dict):
+                break
+    else:
+        usage = None
+
+    # 3) Last-resort: recursively search the message dump.
+    if not isinstance(usage, dict):
+        try:
+            dumped = _message_to_dict(msg)
+        except Exception:
+            dumped = None
+        usage = _find_first_usage_dict(dumped)
+
+    if not isinstance(usage, dict):
+        return None
+
+    prompt_tokens = _coerce_int(usage.get("prompt_tokens"))
+    completion_tokens = _coerce_int(usage.get("completion_tokens"))
+    total_tokens = _coerce_int(usage.get("total_tokens"))
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+
+    out: Dict[str, int] = {}
+    if prompt_tokens is not None:
+        out["prompt_tokens"] = prompt_tokens
+    if completion_tokens is not None:
+        out["completion_tokens"] = completion_tokens
+    if total_tokens is not None:
+        out["total_tokens"] = total_tokens
+    if "total_tokens" not in out and "prompt_tokens" in out and "completion_tokens" in out:
+        out["total_tokens"] = int(out["prompt_tokens"]) + int(out["completion_tokens"])
+
+    # Optional DeepSeek/OpenAI extended fields (don’t fail if absent).
+    for k in ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+        v = _coerce_int(usage.get(k))
+        if v is not None:
+            out[k] = v
+
+    return out
+
+
+@dataclass
+class ToolUsageTracker:
+    """Track tool invocation counts and whether each LLM response requested tools.
+
+    Notes:
+    - "Tool invocation" counts are recorded inside each @tool function (actual execution).
+    - "LLM response tool usage" is based on AIMessage.tool_calls (requested tool calls).
+    """
+
+    tool_call_counts: Dict[str, int] = field(default_factory=dict)
+    llm_responses: List[Dict[str, Any]] = field(default_factory=list)
+    llm_token_totals: Dict[str, int] = field(
+        default_factory=lambda: {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 0,
+        }
+    )
+    llm_token_records: List[Dict[str, Any]] = field(default_factory=list)
+
+    def record_tool_invocation(self, tool_name: str) -> None:
+        if not tool_name:
+            return
+        self.tool_call_counts[tool_name] = int(self.tool_call_counts.get(tool_name, 0)) + 1
+
+    def record_llm_response(self, msg: Any) -> None:
+        # We only care about assistant/AI messages.
+        if not isinstance(msg, AIMessage):
+            return
+
+        # Token usage (DeepSeek/OpenAI-compatible `usage`, or provider-specific metadata).
+        usage = _extract_llm_token_usage(msg)
+        if isinstance(usage, dict) and usage:
+            self.llm_token_records.append(
+                {
+                    "index": len(self.llm_token_records) + 1,
+                    **usage,
+                }
+            )
+            for k in ("prompt_tokens", "completion_tokens", "total_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+                if k in usage:
+                    self.llm_token_totals[k] = int(self.llm_token_totals.get(k, 0)) + int(usage[k])
+
+        raw_calls = getattr(msg, "tool_calls", None) or []
+        tool_names: List[str] = []
+        if isinstance(raw_calls, list):
+            for call in raw_calls:
+                name: Optional[str] = None
+                if isinstance(call, dict):
+                    # LangChain canonical: {"name": "...", "args": {...}, "id": "..."}
+                    name = cast(Optional[str], call.get("name"))
+                    # Some providers may nest: {"function": {"name": "...", ...}}
+                    if not name and isinstance(call.get("function"), dict):
+                        name = cast(Optional[str], call["function"].get("name"))
+                elif hasattr(call, "get") and callable(getattr(call, "get")):
+                    try:
+                        name = cast(Optional[str], call.get("name"))
+                    except Exception:
+                        name = None
+                if isinstance(name, str) and name.strip():
+                    tool_names.append(name.strip())
+
+        # Preserve order but de-duplicate for display.
+        seen: set[str] = set()
+        unique_tool_names: List[str] = []
+        for n in tool_names:
+            if n in seen:
+                continue
+            seen.add(n)
+            unique_tool_names.append(n)
+
+        idx = len(self.llm_responses) + 1
+        self.llm_responses.append(
+            {
+                "index": idx,
+                "has_tools": bool(tool_names),
+                "tool_calls_count": len(tool_names),
+                "tool_names": unique_tool_names,
+            }
+        )
+
+    def _render_tool_efficiency_table(self) -> str:
+        total = sum(int(v) for v in self.tool_call_counts.values())
+        lines: List[str] = []
+        lines.append("工具调用效率统计")
+        lines.append("")
+        lines.append("| 工具名称 | 调用次数 | 占比 |")
+        lines.append("| --- | ---: | ---: |")
+
+        items = sorted(self.tool_call_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+        for name, count in items:
+            pct = (float(count) / float(total) * 100.0) if total else 0.0
+            lines.append(f"| {name} | {int(count)} | {pct:.1f}% |")
+
+        lines.append(f"| **总计** | **{int(total)}** | **100.0%** |" if total else "| **总计** | **0** | **0.0%** |")
+        return "\n".join(lines)
+
+    def _render_llm_tool_usage_table(self) -> str:
+        lines: List[str] = []
+        lines.append("LLM回答工具调用统计")
+        lines.append("")
+        lines.append("| 序号 | 是否调用工具 | 工具列表 | tool_calls数量 |")
+        lines.append("| ---: | --- | --- | ---: |")
+
+        for row in self.llm_responses:
+            has_tools = "是" if row.get("has_tools") else "否"
+            tools = row.get("tool_names") or []
+            tools_str = ", ".join(cast(List[str], tools)) if isinstance(tools, list) else ""
+            count = int(row.get("tool_calls_count") or 0)
+            lines.append(f"| {int(row.get('index') or 0)} | {has_tools} | {tools_str} | {count} |")
+
+        if not self.llm_responses:
+            lines.append("| 0 | 否 |  | 0 |")
+        return "\n".join(lines)
+
+    def _render_llm_token_usage_table(self) -> str:
+        lines: List[str] = []
+        lines.append("LLM Token 使用统计")
+        lines.append("")
+        lines.append("| 序号 | prompt_tokens | completion_tokens | total_tokens | cache_hit | cache_miss |")
+        lines.append("| ---: | ---: | ---: | ---: | ---: | ---: |")
+
+        if not self.llm_token_records:
+            lines.append("| 0 | 0 | 0 | 0 | 0 | 0 |")
+        else:
+            for row in self.llm_token_records:
+                lines.append(
+                    "| {idx} | {p} | {c} | {t} | {hit} | {miss} |".format(
+                        idx=int(row.get("index") or 0),
+                        p=int(row.get("prompt_tokens") or 0),
+                        c=int(row.get("completion_tokens") or 0),
+                        t=int(row.get("total_tokens") or 0),
+                        hit=int(row.get("prompt_cache_hit_tokens") or 0),
+                        miss=int(row.get("prompt_cache_miss_tokens") or 0),
+                    )
+                )
+
+        totals = self.llm_token_totals or {}
+        lines.append(
+            "| **总计** | **{p}** | **{c}** | **{t}** | **{hit}** | **{miss}** |".format(
+                p=int(totals.get("prompt_tokens") or 0),
+                c=int(totals.get("completion_tokens") or 0),
+                t=int(totals.get("total_tokens") or 0),
+                hit=int(totals.get("prompt_cache_hit_tokens") or 0),
+                miss=int(totals.get("prompt_cache_miss_tokens") or 0),
+            )
+        )
+        return "\n".join(lines)
+
+    def render_report(self) -> str:
+        # Keep it clearly separated in the log tail.
+        parts = [
+            "",
+            "====================",
+            self._render_llm_token_usage_table(),
+            "",
+            self._render_tool_efficiency_table(),
+            "",
+            self._render_llm_tool_usage_table(),
+            "====================",
+            "",
+        ]
+        return "\n".join(parts)
+
+
+_TOOL_USAGE = ToolUsageTracker()
 
 
 def _render_ai_content(content) -> str:
@@ -671,6 +991,7 @@ def get_drinks_menu() -> str:
     - If drinks menu already shown in recent conversation (check context first)
     - For restaurant information (use get_restaurant_info instead)
     """
+    _TOOL_USAGE.record_tool_invocation("get_drinks_menu")
     logger.info("Tool get_drinks_menu called")
     return """
     Drinks Menu:
@@ -701,6 +1022,7 @@ def get_food_menu() -> str:
     
     TIP: Always check conversation history before calling. If menu visible, reference it directly.
     """
+    _TOOL_USAGE.record_tool_invocation("get_food_menu")
     logger.info("Tool get_food_menu called")
     return """
     Food Menu:
@@ -776,6 +1098,7 @@ def get_menu_item_price(item_name: str) -> str:
     Returns:
         Price string if found, or error message if item not in menu
     """
+    _TOOL_USAGE.record_tool_invocation("get_menu_item_price")
     logger.info(f"Tool get_menu_item_price called: item_name={item_name}")
     if item_name in menu_prices:
         return f"{item_name} costs ${menu_prices[item_name]:.2f}"
@@ -798,6 +1121,7 @@ def get_restaurant_info() -> str:
     NOTE:
     - After calling this tool, do NOT automatically call get_food_menu/get_drinks_menu unless the user explicitly asks.
     """
+    _TOOL_USAGE.record_tool_invocation("get_restaurant_info")
     logger.info("Tool get_restaurant_info called")
     return """
     === VILLA TOSCANA ===
@@ -854,6 +1178,7 @@ def update_customer_profile(
     Use this when the user states personal preferences or constraints so the agent can
     reliably remember them without re-parsing free text.
     """
+    _TOOL_USAGE.record_tool_invocation("update_customer_profile")
     if not isinstance(state, dict):
         return Command(
             update={
@@ -1109,6 +1434,7 @@ def cashier_calculate_total(
     Returns:
         Total amount including tip, or error message if order not found
     """
+    _TOOL_USAGE.record_tool_invocation("cashier_calculate_total")
     logger.info(f"Calculating total for order {order_id}")
 
     if not isinstance(state, dict):
@@ -1203,6 +1529,7 @@ def check_payment(
     Returns:
         Payment status: "cash_ok", "insufficient_funds", "valid", "invalid", or error
     """
+    _TOOL_USAGE.record_tool_invocation("check_payment")
     logger.info(f"Processing payment: ${amount} via {method} for order {order_id}")
 
     if not isinstance(state, dict):
@@ -1304,6 +1631,7 @@ def create_order(
     Returns:
         Message with order ID and status (e.g., "Order 123 created with status 'pending'")
     """
+    _TOOL_USAGE.record_tool_invocation("create_order")
     try:
         if not isinstance(state, dict):
             msg = "Error creating order: missing_state"
@@ -1640,6 +1968,7 @@ def process_order(
     Returns:
         JSON with order status and per-item stock check results
     """
+    _TOOL_USAGE.record_tool_invocation("process_order")
     logger.info(f"Processing order {order_id}")
 
     if not isinstance(state, dict):
@@ -1748,75 +2077,216 @@ def process_order(
 
 # -------------------------- LLM and Workflow Initialization -------------------------- #
 
-def _build_llm():
-    """Select a single chat model based on env vars.
+def _normalize_model_choice(value: Optional[str]) -> str:
+    """Normalize CLI model choice to one of: auto|gemini|deepseek|nvidia."""
+    if not value:
+        return "auto"
+    v = str(value).strip().lower().replace("_", "").replace("-", "")
+    if v in {"auto", "default"}:
+        return "auto"
+    if v in {"gemini", "google", "googleai"}:
+        return "gemini"
+    if v in {"deepseek", "deepseekai", "deepseekchat"}:
+        return "deepseek"
+    if v in {"nvidia", "nim", "nv"}:
+        return "nvidia"
+    return v
 
-    Priority: Gemini -> DeepSeek -> Azure OpenAI.
+
+def _resolve_model_spec(model_spec: Optional[str]) -> tuple[str, str]:
+    """Resolve `-model` into (provider_choice, llm_model_override).
+
+    Supported:
+    - auto/default -> ("auto", "")
+    - kimi|minimax|qwen -> ("nvidia", "<mapped model id>")
+    - values starting with "gemini" (e.g. gemini-3-flash-preview) -> ("gemini", "<value>")
+    - values containing "/" (e.g. moonshotai/kimi-k2-thinking) -> ("nvidia", "<value>")
+    - provider words gemini|deepseek|nvidia -> ("<provider>", "")
+
+    Otherwise we assume the user is passing a Gemini model id (matches your preferred usage).
+    """
+    spec = str(model_spec or "").strip()
+    if not spec:
+        return ("auto", "")
+
+    low = spec.lower().strip()
+    if low in {"auto", "default"}:
+        return ("auto", "")
+
+    alias_map = {
+        "kimi": "moonshotai/kimi-k2-thinking",
+        "minimax": "minimaxai/minimax-m2",
+        "qwen": "qwen/qwen3-next-80b-a3b-instruct",
+    }
+    if low in alias_map:
+        return ("nvidia", alias_map[low])
+
+    normalized = _normalize_model_choice(low)
+    if normalized in {"gemini", "deepseek", "nvidia"}:
+        return (normalized, "")
+
+    if low.startswith("gemini"):
+        return ("gemini", spec)
+
+    if low.startswith("deepseek"):
+        return ("deepseek", spec)
+
+    if "/" in spec:
+        return ("nvidia", spec)
+
+    # Default: treat as a Gemini model id (e.g. "gemini-3-flash-preview").
+    return ("gemini", spec)
+
+
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="waiter_react_agent.py",
+        description="Restaurant waiter agent (LangGraph) with tool-call logging + usage stats.",
+    )
+    parser.add_argument(
+        "-model",
+        "--model",
+        default="auto",
+        help=(
+            "Model spec (simplified). Examples: auto | kimi | minimax | qwen | "
+            "gemini-3-flash-preview | moonshotai/kimi-k2-thinking"
+        ),
+    )
+    parser.add_argument(
+        "--llm-model",
+        default="",
+        help="Override model name (e.g. moonshotai/kimi-k2-thinking). If empty, uses env vars.",
+    )
+    return parser.parse_args(args=argv)
+
+
+def _build_llm_with_choice(model_choice: str, *, llm_model_override: str = ""):
+    """Select a single chat model based on env vars (or explicit CLI choice).
+
+    Priority when model=auto: Gemini -> DeepSeek -> NVIDIA.
 
     Notes:
     - We rely on a recent `langchain-google-genai` + `google-genai` SDK that supports
-      Gemini 3 thought signatures for tool/function calling. We do NOT implement
-      fallbacks to older Gemini models here.
+      Gemini tool/function calling. We do NOT implement fallbacks to older Gemini models here.
+    - NVIDIA is treated as an OpenAI-compatible endpoint (base_url + api_key).
     """
+    choice = _normalize_model_choice(model_choice)
+    llm_model_override = str(llm_model_override or "").strip()
+
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     gemini_model = (
         os.getenv("GEMINI_MODEL_FLASH30")
         or os.getenv("GEMINI_MODEL_FLASH20")
+        or os.getenv("GEMINI_MODEL_PRO3")
     )
-    if gemini_api_key and gemini_model:
-        logger.info(f"Using Gemini model: {gemini_model}")
+
+    deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
+    deepseek_endpoint = os.getenv("DEEPSEEK_ENDPOINT")
+    deepseek_model = os.getenv("DEEPSEEK_MODEL")
+
+    nvidia_endpoint = os.getenv("NVIDIA_ENDPOINT")
+    nvidia_api_key = os.getenv("NVIDIA_API_KEY")
+    nvidia_model = (
+        os.getenv("NVIDIA_MODEL")
+        or os.getenv("NVIDIA_MODEL_KIMI")
+        or os.getenv("NVIDIA_MODEL_MINIMAX")
+        or os.getenv("NVIDIA_MODEL_QWEN")
+    )
+
+    def _missing_hint_for_choice() -> str:
+        if choice == "gemini":
+            return (
+                "No LLM is configured for model=gemini.\n\n"
+                "Set:\n"
+                "- GEMINI_API_KEY\n"
+                "- GEMINI_MODEL_FLASH30 (or GEMINI_MODEL_FLASH20)\n"
+            )
+        if choice == "deepseek":
+            return (
+                "No LLM is configured for model=deepSeek.\n\n"
+                "Set:\n"
+                "- DEEPSEEK_API_KEY\n"
+                "- DEEPSEEK_ENDPOINT\n"
+                "- DEEPSEEK_MODEL\n"
+            )
+        if choice == "nvidia":
+            return (
+                "No LLM is configured for model=nvidia.\n\n"
+                "Set:\n"
+                "- NVIDIA_ENDPOINT\n"
+                "- NVIDIA_API_KEY\n"
+                "- NVIDIA_MODEL (or NVIDIA_MODEL_KIMI / NVIDIA_MODEL_MINIMAX / NVIDIA_MODEL_QWEN)\n"
+            )
+        return (
+            "Unknown -model value.\n\n"
+            "Use one of: auto | gemini | deepSeek | nvidia\n"
+        )
+
+    # Gemini
+    if choice in {"auto", "gemini"} and gemini_api_key and (llm_model_override or gemini_model):
+        chosen = llm_model_override or gemini_model
+        logger.info(f"Using Gemini model: {chosen}")
         return ChatGoogleGenerativeAI(
-            model=gemini_model,
+            model=cast(str, chosen),
             api_key=gemini_api_key,
             temperature=1,
             max_tokens=4096,
             timeout=60,
         )
 
-    deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
-    deepseek_endpoint = os.getenv("DEEPSEEK_ENDPOINT")
-    deepseek_model = os.getenv("DEEPSEEK_MODEL")
-    if deepseek_api_key and deepseek_endpoint and deepseek_model:
-        logger.info(f"Using DeepSeek model: {deepseek_model}")
+    # DeepSeek (OpenAI-compatible endpoint)
+    if choice in {"auto", "deepseek"} and deepseek_api_key and deepseek_endpoint and (llm_model_override or deepseek_model):
+        chosen = llm_model_override or deepseek_model
+        logger.info(f"Using DeepSeek model: {chosen}")
         return ChatOpenAI(
             api_key=deepseek_api_key,
             base_url=deepseek_endpoint,
-            model=deepseek_model,
+            model=cast(str, chosen),
             temperature=0.5,
             max_tokens=4096,
         )
 
-    azure_api_key = os.getenv("OPENAI_API_KEY")
-    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    azure_deployment = os.getenv("OPENAI_MODEL_4o")
-    azure_api_version = os.getenv("AZURE_API_VERSION")
-    if azure_api_key and azure_endpoint and azure_deployment and azure_api_version:
-        logger.info(f"Using Azure OpenAI deployment: {azure_deployment}")
-        return AzureChatOpenAI(
-            api_key=azure_api_key,
-            azure_endpoint=azure_endpoint,
-            deployment_name=azure_deployment,
-            api_version=azure_api_version,
-            temperature=0.5,
-            max_tokens=4000,
+    # NVIDIA (OpenAI-compatible endpoint)
+    if choice in {"auto", "nvidia"} and nvidia_api_key and nvidia_endpoint and (llm_model_override or nvidia_model):
+        chosen = llm_model_override or nvidia_model
+        logger.info(f"Using NVIDIA OpenAI-compatible model: {chosen}")
+        return ChatOpenAI(
+            api_key=nvidia_api_key,
+            base_url=nvidia_endpoint,
+            model=cast(str, chosen),
+            temperature=0.6,
+            max_tokens=8192,
         )
+
+    if choice != "auto":
+        raise RuntimeError(_missing_hint_for_choice())
 
     missing_hint = (
         "No LLM is configured.\n\n"
-        "Set ONE of the following env-var sets (PowerShell examples):\n"
+        "This script automatically reads `.env` (if present) and OS environment variables.\n\n"
+        "Provide ONE of the following env-var sets:\n"
         "- Gemini:\n"
-        "  $env:GEMINI_API_KEY=\"...\"; $env:GEMINI_MODEL_FLASH30=\"gemini-2.0-flash\"; python waiter_react_agent.py\n"
-        "  (or use GEMINI_MODEL_FLASH20 / GEMINI_MODEL_FLASH15)\n"
+        "  - GEMINI_API_KEY\n"
+        "  - GEMINI_MODEL_FLASH30 (or GEMINI_MODEL_FLASH20)\n"
         "- DeepSeek:\n"
-        "  $env:DEEPSEEK_API_KEY=\"...\"; $env:DEEPSEEK_ENDPOINT=\"...\"; $env:DEEPSEEK_MODEL=\"...\"; python waiter_react_agent.py\n\n"
-        "- Azure OpenAI:\n"
-        "  $env:OPENAI_API_KEY=\"...\"; $env:AZURE_OPENAI_ENDPOINT=\"...\"; $env:OPENAI_MODEL_4o=\"...\"; $env:AZURE_API_VERSION=\"...\"; python waiter_react_agent.py\n"
+        "  - DEEPSEEK_API_KEY\n"
+        "  - DEEPSEEK_ENDPOINT\n"
+        "  - DEEPSEEK_MODEL\n"
+        "- NVIDIA (OpenAI compatible):\n"
+        "  - NVIDIA_ENDPOINT\n"
+        "  - NVIDIA_API_KEY\n"
+        "  - NVIDIA_MODEL (optional; or pass -model kimi/minimax/qwen)\n\n"
         "Detected presence (True/False):\n"
         f"- GEMINI_API_KEY: {bool(gemini_api_key)}; GEMINI_MODEL_FLASH30/20/15: {bool(gemini_model)}\n"
         f"- DEEPSEEK_API_KEY: {bool(deepseek_api_key)}; DEEPSEEK_ENDPOINT: {bool(deepseek_endpoint)}; DEEPSEEK_MODEL: {bool(deepseek_model)}\n"
-        f"- OPENAI_API_KEY: {bool(azure_api_key)}; AZURE_OPENAI_ENDPOINT: {bool(azure_endpoint)}; OPENAI_MODEL_4o: {bool(azure_deployment)}; AZURE_API_VERSION: {bool(azure_api_version)}\n"
+        f"- NVIDIA_API_KEY: {bool(nvidia_api_key)}; NVIDIA_ENDPOINT: {bool(nvidia_endpoint)}; NVIDIA_MODEL: {bool(nvidia_model)}\n"
     )
     raise RuntimeError(missing_hint)
+
+
+def _build_llm():
+    """Backwards-compatible entry: keep default auto selection."""
+    return _build_llm_with_choice("auto")
 
 
 # Add our expanded tools
@@ -1849,14 +2319,16 @@ def _agent_node(state: RestaurantOrderState) -> Dict:
     # Some providers (notably Gemini) reject requests with no "contents". If we have no
     # user/assistant history yet, don't call the model—return a deterministic greeting.
     if not messages and not summary:
+        greeting = AIMessage(
+            content=(
+                "Welcome to Villa Toscana! I'm delighted to have you with us today. "
+                "Would you like to see the food or drinks menu, or can I recommend something to start?"
+            )
+        )
+        _TOOL_USAGE.record_llm_response(greeting)
         return {
             "messages": [
-                AIMessage(
-                    content=(
-                        "Welcome to Villa Toscana! I'm delighted to have you with us today. "
-                        "Would you like to see the food or drinks menu, or can I recommend something to start?"
-                    )
-                )
+                greeting
             ],
             "conversation_rounds": 0,
         }
@@ -1917,6 +2389,18 @@ def _agent_node(state: RestaurantOrderState) -> Dict:
         if model_with_tools is None:
             raise RuntimeError("LLM is not initialized. Start the script via __main__.")
         response = model_with_tools.invoke(model_messages)
+        _TOOL_USAGE.record_llm_response(response)
+        usage = _extract_llm_token_usage(response)
+        if isinstance(usage, dict) and usage:
+            logger.info(
+                "LLM usage: prompt_tokens={p} completion_tokens={c} total_tokens={t} cache_hit={hit} cache_miss={miss}".format(
+                    p=int(usage.get("prompt_tokens") or 0),
+                    c=int(usage.get("completion_tokens") or 0),
+                    t=int(usage.get("total_tokens") or 0),
+                    hit=int(usage.get("prompt_cache_hit_tokens") or 0),
+                    miss=int(usage.get("prompt_cache_miss_tokens") or 0),
+                )
+            )
         formatted_response = _format_messages_for_log(response)
         logger.info(f"LLM response:\n{formatted_response}")
         return {"messages": [response], "conversation_rounds": conversation_rounds}
@@ -1925,6 +2409,7 @@ def _agent_node(state: RestaurantOrderState) -> Dict:
         error_message = AIMessage(
             content="I apologize, but I'm having trouble processing your request. Could you please try again?"
         )
+        _TOOL_USAGE.record_llm_response(error_message)
         return {"messages": [error_message], "conversation_rounds": conversation_rounds}
 
 
@@ -2052,7 +2537,10 @@ if __name__ == "__main__":
 
     try:
         # Initialize model at runtime so missing env-vars don't print a full traceback on import.
-        llm = _build_llm()
+        args = _parse_args()
+        provider_choice, resolved_model = _resolve_model_spec(getattr(args, "model", "auto"))
+        llm_model_override = resolved_model or getattr(args, "llm_model", "")
+        llm = _build_llm_with_choice(provider_choice, llm_model_override=llm_model_override)
         model_with_tools = llm.bind_tools(tools)
 
         # Auto-run golden dataset on startup (if present) to smoke-test the agent framework.
@@ -2097,3 +2585,10 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Critical error: {str(e)}", exc_info=True)
         print("\nWaiter: I apologize, but our system is currently unavailable. Please try again later.")
+    finally:
+        # Always append tool usage summary at the very end of the log.
+        try:
+            logger.info(_TOOL_USAGE.render_report())
+        except Exception:
+            # Never fail shutdown due to reporting.
+            pass

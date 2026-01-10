@@ -4,3 +4,4 @@ myvenv/
 *.log
 *.pyc
 *.json
+evaluation_reports/
