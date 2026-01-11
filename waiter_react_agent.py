@@ -7,6 +7,7 @@ This script demonstrates an LLM-powered restaurant waiter with a custom LangGrap
 4. Billing and payment (with a 15% tip, random 20% chance of invalid credit card).
 5. Graceful error handling and request for alternate payment method if necessary.
 
+----- important! DO NOT DELETE -----
 运行说明（可直接复制粘贴）
 
 1) 默认自动选择（优先级：Gemini -> DeepSeek -> NVIDIA）
@@ -2678,6 +2679,9 @@ def _run_golden_dataset(dataset_path: Path) -> None:
 
         print(f"[golden #{case_id}] Waiter: {rendered}\n")
         logger.info(f"[golden #{case_id}] AI response: {rendered}")
+        # Visual separator between rounds in the log file.
+        logger.info("")
+        logger.info("----------------------------------------------------------")
 
     logger.info("Golden dataset run complete")
     print("[golden] Done.\n")
@@ -2728,9 +2732,9 @@ if __name__ == "__main__":
                 rendered = _render_ai_content(ai_messages[-1].content)
                 print("\nWaiter:", rendered)
                 logger.info(f"AI response: {rendered}")
+                # Visual separator between rounds in the log file.
                 logger.info("")
-                logger.info("------------------------------------")
-                logger.info("")
+                logger.info("---")
 
     except RuntimeError as e:
         # Configuration issues (e.g., missing API keys) should not dump a full traceback to the terminal.
