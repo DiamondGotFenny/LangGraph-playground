@@ -32,7 +32,21 @@ NVIDIA（OpenAI兼容接口）：
     python waiter_react_agent.py -model minimax                     # minimaxai/minimax-m2
     python waiter_react_agent.py -model qwen                        # qwen/qwen3-next-80b-a3b-instruct
 
+OpenRouter（OpenAI兼容接口；使用 OPENROUTER_API_KEY）：
+
+    python waiter_react_agent.py -model qwen235b                    # qwen/qwen3-235b-a22b-2507
+    python waiter_react_agent.py -model "qwen/qwen3-235b-a22b-2507"  # 直接指定模型 ID
+    python waiter_react_agent.py -model sonnet45                    # anthropic/claude-sonnet-4.5
+    python waiter_react_agent.py -model "anthropic/claude-sonnet-4.5" # 直接指定模型 ID
+    python waiter_react_agent.py -model glm47                       # z-ai/glm-4.7
+    python waiter_react_agent.py -model "z-ai/glm-4.7"              # 直接指定模型 ID
+
 说明：本脚本会在运行时自动读取 `.env`（如果存在）以及系统环境变量，无需在命令行里手动 `$env:...`。
+
+3) 手动输入模式（跳过启动时自动跑 golden dataset）
+
+    python waiter_react_agent.py -free
+    python waiter_react_agent.py -free -model kimi
 
 帮助：
 
@@ -52,6 +66,9 @@ import os
 import random
 import re
 import copy
+import sys
+import time
+import threading
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -104,6 +121,78 @@ def ensure_log_file(log_file_path: str) -> str:
 # Setup logger with guaranteed log file
 log_file_path = ensure_log_file("waiter_react_agent.log")
 logger = setup_logger(log_file_path, log_to_console=False)
+
+
+LLM_CALL_HARD_TIMEOUT_SECS = 60  # no data/result within 60s => exit (avoid hangs)
+LLM_MAX_RETRIES = 3              # for transient errors (not for hard timeout)
+LLM_RETRY_BACKOFF_SECS = 1.5
+LLM_RETRY_JITTER_SECS = 0.5
+
+
+def _invoke_in_daemon_thread(fn, *, timeout_secs: float):
+    """Run blocking fn() in a daemon thread and enforce a hard timeout.
+
+    On Windows, a stuck network call can block indefinitely; daemon thread ensures
+    the process can still exit even if the worker thread is hung.
+    """
+    result_box: Dict[str, Any] = {}
+    err_box: Dict[str, BaseException] = {}
+
+    def _runner():
+        try:
+            result_box["value"] = fn()
+        except BaseException as e:  # noqa: BLE001 - must capture everything from worker
+            err_box["err"] = e
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join(timeout=float(timeout_secs))
+
+    if t.is_alive():
+        raise TimeoutError(f"LLM call timed out after {timeout_secs:.0f}s without returning.")
+    if "err" in err_box:
+        raise err_box["err"]
+    return result_box.get("value")
+
+
+def _sleep_with_jitter(base_secs: float, jitter_secs: float) -> None:
+    base = max(0.0, float(base_secs))
+    jitter = max(0.0, float(jitter_secs))
+    delay = base + (random.random() * jitter if jitter else 0.0)
+    time.sleep(delay)
+
+
+def _invoke_llm_with_retries(llm_runnable, model_messages: List[AnyMessage]) -> AIMessage:
+    """Invoke remote LLM with retries + hard timeout.
+
+    - Hard timeout: if no result within LLM_CALL_HARD_TIMEOUT_SECS => exit program (avoid hang).
+    - Retries: for transient exceptions (network errors, 5xx, etc.).
+    """
+    last_err: Optional[BaseException] = None
+    for attempt in range(1, int(LLM_MAX_RETRIES) + 1):
+        try:
+            return cast(
+                AIMessage,
+                _invoke_in_daemon_thread(
+                    lambda: llm_runnable.invoke(model_messages),
+                    timeout_secs=float(LLM_CALL_HARD_TIMEOUT_SECS),
+                ),
+            )
+        except TimeoutError as e:
+            # Requirement: 1 minute with no data/result => exit to avoid deadlock/hang.
+            logger.error(f"[llm] hard-timeout: {e}")
+            raise SystemExit(2) from e
+        except BaseException as e:  # noqa: BLE001 - we want robust retries for remote failures
+            last_err = e
+            logger.warning(f"[llm] invoke failed (attempt {attempt}/{LLM_MAX_RETRIES}): {type(e).__name__}: {e}")
+            if attempt >= int(LLM_MAX_RETRIES):
+                break
+            _sleep_with_jitter(LLM_RETRY_BACKOFF_SECS * attempt, LLM_RETRY_JITTER_SECS)
+            continue
+
+    # Out of retries.
+    assert last_err is not None
+    raise last_err
 
 
 def _coerce_int(value: Any) -> Optional[int]:
@@ -2078,7 +2167,7 @@ def process_order(
 # -------------------------- LLM and Workflow Initialization -------------------------- #
 
 def _normalize_model_choice(value: Optional[str]) -> str:
-    """Normalize CLI model choice to one of: auto|gemini|deepseek|nvidia."""
+    """Normalize CLI model choice to one of: auto|gemini|deepseek|nvidia|openrouter."""
     if not value:
         return "auto"
     v = str(value).strip().lower().replace("_", "").replace("-", "")
@@ -2090,6 +2179,8 @@ def _normalize_model_choice(value: Optional[str]) -> str:
         return "deepseek"
     if v in {"nvidia", "nim", "nv"}:
         return "nvidia"
+    if v in {"openrouter", "or"}:
+        return "openrouter"
     return v
 
 
@@ -2099,9 +2190,12 @@ def _resolve_model_spec(model_spec: Optional[str]) -> tuple[str, str]:
     Supported:
     - auto/default -> ("auto", "")
     - kimi|minimax|qwen -> ("nvidia", "<mapped model id>")
+    - qwen235b -> ("openrouter", "qwen/qwen3-235b-a22b-2507")
+    - sonnet45 -> ("openrouter", "anthropic/claude-sonnet-4.5")
+    - glm47 -> ("openrouter", "z-ai/glm-4.7")
     - values starting with "gemini" (e.g. gemini-3-flash-preview) -> ("gemini", "<value>")
     - values containing "/" (e.g. moonshotai/kimi-k2-thinking) -> ("nvidia", "<value>")
-    - provider words gemini|deepseek|nvidia -> ("<provider>", "")
+    - provider words gemini|deepseek|nvidia|openrouter -> ("<provider>", "")
 
     Otherwise we assume the user is passing a Gemini model id (matches your preferred usage).
     """
@@ -2113,6 +2207,22 @@ def _resolve_model_spec(model_spec: Optional[str]) -> tuple[str, str]:
     if low in {"auto", "default"}:
         return ("auto", "")
 
+    # Special-case OpenRouter model(s) that should NOT go through NVIDIA's endpoint.
+    # (OpenRouter is also OpenAI-compatible, but uses OPENROUTER_API_KEY + its own base_url.)
+    openrouter_alias_map = {
+        "qwen235b": "qwen/qwen3-235b-a22b-2507",
+        "sonnet45": "anthropic/claude-sonnet-4.5",
+        "glm47": "z-ai/glm-4.7",
+    }
+    if low in openrouter_alias_map:
+        return ("openrouter", openrouter_alias_map[low])
+    if low == "qwen/qwen3-235b-a22b-2507":
+        return ("openrouter", spec)
+    if low == "anthropic/claude-sonnet-4.5":
+        return ("openrouter", spec)
+    if low == "z-ai/glm-4.7":
+        return ("openrouter", spec)
+
     alias_map = {
         "kimi": "moonshotai/kimi-k2-thinking",
         "minimax": "minimaxai/minimax-m2",
@@ -2122,7 +2232,7 @@ def _resolve_model_spec(model_spec: Optional[str]) -> tuple[str, str]:
         return ("nvidia", alias_map[low])
 
     normalized = _normalize_model_choice(low)
-    if normalized in {"gemini", "deepseek", "nvidia"}:
+    if normalized in {"gemini", "deepseek", "nvidia", "openrouter"}:
         return (normalized, "")
 
     if low.startswith("gemini"):
@@ -2144,12 +2254,22 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="Restaurant waiter agent (LangGraph) with tool-call logging + usage stats.",
     )
     parser.add_argument(
+        "-free",
+        "--free",
+        action="store_true",
+        help=(
+            "Free mode: do NOT auto-run user queries from "
+            "waiter_agent_accessment_golden_dataset.json on startup; "
+            "start in interactive terminal input mode immediately."
+        ),
+    )
+    parser.add_argument(
         "-model",
         "--model",
         default="auto",
         help=(
-            "Model spec (simplified). Examples: auto | kimi | minimax | qwen | "
-            "gemini-3-flash-preview | moonshotai/kimi-k2-thinking"
+            "Model spec (simplified). Examples: auto | kimi | minimax | qwen | qwen235b | sonnet45 | glm47 | "
+            "gemini-3-flash-preview | moonshotai/kimi-k2-thinking | qwen/qwen3-235b-a22b-2507 | anthropic/claude-sonnet-4.5 | z-ai/glm-4.7"
         ),
     )
     parser.add_argument(
@@ -2169,6 +2289,8 @@ def _build_llm_with_choice(model_choice: str, *, llm_model_override: str = ""):
     - We rely on a recent `langchain-google-genai` + `google-genai` SDK that supports
       Gemini tool/function calling. We do NOT implement fallbacks to older Gemini models here.
     - NVIDIA is treated as an OpenAI-compatible endpoint (base_url + api_key).
+    - OpenRouter is treated as an OpenAI-compatible endpoint (base_url + api_key), but uses
+      OPENROUTER_API_KEY and its own base_url (defaults to https://openrouter.ai/api/v1).
     """
     choice = _normalize_model_choice(model_choice)
     llm_model_override = str(llm_model_override or "").strip()
@@ -2192,6 +2314,10 @@ def _build_llm_with_choice(model_choice: str, *, llm_model_override: str = ""):
         or os.getenv("NVIDIA_MODEL_MINIMAX")
         or os.getenv("NVIDIA_MODEL_QWEN")
     )
+
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+    openrouter_endpoint = os.getenv("OPENROUTER_ENDPOINT") or "https://openrouter.ai/api/v1"
+    openrouter_model = os.getenv("OPENROUTER_MODEL")
 
     def _missing_hint_for_choice() -> str:
         if choice == "gemini":
@@ -2217,9 +2343,17 @@ def _build_llm_with_choice(model_choice: str, *, llm_model_override: str = ""):
                 "- NVIDIA_API_KEY\n"
                 "- NVIDIA_MODEL (or NVIDIA_MODEL_KIMI / NVIDIA_MODEL_MINIMAX / NVIDIA_MODEL_QWEN)\n"
             )
+        if choice == "openrouter":
+            return (
+                "No LLM is configured for model=openrouter.\n\n"
+                "Set:\n"
+                "- OPENROUTER_API_KEY\n"
+                "- OPENROUTER_MODEL (optional; or pass -model qwen235b / sonnet45 / glm47 / qwen/qwen3-235b-a22b-2507 / anthropic/claude-sonnet-4.5 / z-ai/glm-4.7)\n"
+                "- OPENROUTER_ENDPOINT (optional; default: https://openrouter.ai/api/v1)\n"
+            )
         return (
             "Unknown -model value.\n\n"
-            "Use one of: auto | gemini | deepSeek | nvidia\n"
+            "Use one of: auto | gemini | deepSeek | nvidia | openrouter\n"
         )
 
     # Gemini
@@ -2258,6 +2392,18 @@ def _build_llm_with_choice(model_choice: str, *, llm_model_override: str = ""):
             max_tokens=8192,
         )
 
+    # OpenRouter (OpenAI-compatible endpoint)
+    if choice in {"openrouter"} and openrouter_api_key and (llm_model_override or openrouter_model):
+        chosen = llm_model_override or openrouter_model
+        logger.info(f"Using OpenRouter OpenAI-compatible model: {chosen}")
+        return ChatOpenAI(
+            api_key=openrouter_api_key,
+            base_url=openrouter_endpoint,
+            model=cast(str, chosen),
+            temperature=0.6,
+            max_tokens=8192,
+        )
+
     if choice != "auto":
         raise RuntimeError(_missing_hint_for_choice())
 
@@ -2276,10 +2422,15 @@ def _build_llm_with_choice(model_choice: str, *, llm_model_override: str = ""):
         "  - NVIDIA_ENDPOINT\n"
         "  - NVIDIA_API_KEY\n"
         "  - NVIDIA_MODEL (optional; or pass -model kimi/minimax/qwen)\n\n"
+        "- OpenRouter (OpenAI compatible):\n"
+        "  - OPENROUTER_API_KEY\n"
+        "  - OPENROUTER_MODEL (optional; or pass -model qwen235b / sonnet45 / glm47 / qwen/qwen3-235b-a22b-2507 / anthropic/claude-sonnet-4.5 / z-ai/glm-4.7)\n"
+        "  - OPENROUTER_ENDPOINT (optional; default: https://openrouter.ai/api/v1)\n\n"
         "Detected presence (True/False):\n"
         f"- GEMINI_API_KEY: {bool(gemini_api_key)}; GEMINI_MODEL_FLASH30/20/15: {bool(gemini_model)}\n"
         f"- DEEPSEEK_API_KEY: {bool(deepseek_api_key)}; DEEPSEEK_ENDPOINT: {bool(deepseek_endpoint)}; DEEPSEEK_MODEL: {bool(deepseek_model)}\n"
         f"- NVIDIA_API_KEY: {bool(nvidia_api_key)}; NVIDIA_ENDPOINT: {bool(nvidia_endpoint)}; NVIDIA_MODEL: {bool(nvidia_model)}\n"
+        f"- OPENROUTER_API_KEY: {bool(openrouter_api_key)}; OPENROUTER_ENDPOINT: {bool(openrouter_endpoint)}; OPENROUTER_MODEL: {bool(openrouter_model)}\n"
     )
     raise RuntimeError(missing_hint)
 
@@ -2388,7 +2539,7 @@ def _agent_node(state: RestaurantOrderState) -> Dict:
         logger.info(f"LLM input (len={len(model_messages)}):\n{formatted_input}")
         if model_with_tools is None:
             raise RuntimeError("LLM is not initialized. Start the script via __main__.")
-        response = model_with_tools.invoke(model_messages)
+        response = _invoke_llm_with_retries(model_with_tools, model_messages)
         _TOOL_USAGE.record_llm_response(response)
         usage = _extract_llm_token_usage(response)
         if isinstance(usage, dict) and usage:
@@ -2545,7 +2696,7 @@ if __name__ == "__main__":
 
         # Auto-run golden dataset on startup (if present) to smoke-test the agent framework.
         dataset_path = Path(__file__).with_name("waiter_agent_accessment_golden_dataset.json")
-        if dataset_path.exists():
+        if dataset_path.exists() and not bool(getattr(args, "free", False)):
             try:
                 _reset_simulation_state()
                 _run_golden_dataset(dataset_path)
@@ -2555,6 +2706,9 @@ if __name__ == "__main__":
             finally:
                 # Ensure interactive mode starts from a clean slate.
                 _reset_simulation_state()
+        elif dataset_path.exists():
+            logger.info("Free mode enabled; skipping golden dataset autorun")
+            print("[golden] Skipped (free mode enabled).")
 
         while True:
             user_input = input("\nYou: ")
