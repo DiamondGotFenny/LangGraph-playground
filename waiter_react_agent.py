@@ -44,6 +44,7 @@ OpenRouter（OpenAI兼容接口；使用 OPENROUTER_API_KEY）：
     python waiter_react_agent.py -model "qwen/qwen3-max"                    # qwen/qwen3-max
     python waiter_react_agent.py -model "openai/gpt-5.2-chat"       # openai/gpt-5.2-chat
     python waiter_react_agent.py -model "minimax/minimax-m2.1"      # minimax/minimax-m2.1
+    python waiter_react_agent.py -model "x-ai/grok-4.1-fast"       # x-ai/grok-4.1-fast
 
 说明：本脚本会在运行时自动读取 `.env`（如果存在）以及系统环境变量，无需在命令行里手动 `$env:...`。
 
@@ -2231,6 +2232,8 @@ def _resolve_model_spec(model_spec: Optional[str]) -> tuple[str, str]:
     if low == "openai/gpt-5.2-chat":
         return ("openrouter", spec)
     if low == "minimax/minimax-m2.1":
+        return ("openrouter", spec)
+    if low == "x-ai/grok-4.1-fast":
         return ("openrouter", spec)
 
     alias_map = {
