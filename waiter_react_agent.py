@@ -41,6 +41,9 @@ OpenRouter（OpenAI兼容接口；使用 OPENROUTER_API_KEY）：
     python waiter_react_agent.py -model "anthropic/claude-sonnet-4.5" # 直接指定模型 ID
     python waiter_react_agent.py -model glm47                       # z-ai/glm-4.7
     python waiter_react_agent.py -model "z-ai/glm-4.7"              # 直接指定模型 ID
+    python waiter_react_agent.py -model "qwen/qwen3-max"                    # qwen/qwen3-max
+    python waiter_react_agent.py -model "openai/gpt-5.2-chat"       # openai/gpt-5.2-chat
+    python waiter_react_agent.py -model "minimax/minimax-m2.1"      # minimax/minimax-m2.1
 
 说明：本脚本会在运行时自动读取 `.env`（如果存在）以及系统环境变量，无需在命令行里手动 `$env:...`。
 
@@ -2222,6 +2225,12 @@ def _resolve_model_spec(model_spec: Optional[str]) -> tuple[str, str]:
     if low == "anthropic/claude-sonnet-4.5":
         return ("openrouter", spec)
     if low == "z-ai/glm-4.7":
+        return ("openrouter", spec)
+    if low == "qwen/qwen3-max":
+        return ("openrouter", spec)
+    if low == "openai/gpt-5.2-chat":
+        return ("openrouter", spec)
+    if low == "minimax/minimax-m2.1":
         return ("openrouter", spec)
 
     alias_map = {
