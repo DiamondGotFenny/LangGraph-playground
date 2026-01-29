@@ -27,9 +27,13 @@ DeepSeek：
 
     python waiter_react_agent.py -model "deepseek-chat"            # 对应 .env: DEEPSEEK_MODEL
 
+Kimi（OpenAI兼容接口；使用 KIMI_API_KEY / KIMI_BASE_URL；模型固定为 "kimi-k2.5"）：
+
+    python waiter_react_agent.py -model kimi                        # 官方 Kimi，模型 id 为 "kimi-k2.5"
+
 NVIDIA（OpenAI兼容接口）：
 
-    python waiter_react_agent.py -model kimi                       # moonshotai/kimi-k2-thinking
+    python waiter_react_agent.py -model kimi-N                      # moonshotai/kimi-k2-thinking（NVIDIA 平台 Kimi）
     python waiter_react_agent.py -model minimax                     # minimaxai/minimax-m2
     python waiter_react_agent.py -model qwen                        # qwen/qwen3-next-80b-a3b-instruct
 
@@ -2172,7 +2176,7 @@ def process_order(
 # -------------------------- LLM and Workflow Initialization -------------------------- #
 
 def _normalize_model_choice(value: Optional[str]) -> str:
-    """Normalize CLI model choice to one of: auto|gemini|deepseek|nvidia|openrouter."""
+    """Normalize CLI model choice to one of: auto|gemini|deepseek|kimi|nvidia|openrouter."""
     if not value:
         return "auto"
     v = str(value).strip().lower().replace("_", "").replace("-", "")
@@ -2182,7 +2186,10 @@ def _normalize_model_choice(value: Optional[str]) -> str:
         return "gemini"
     if v in {"deepseek", "deepseekai", "deepseekchat"}:
         return "deepseek"
-    if v in {"nvidia", "nim", "nv"}:
+    if v in {"kimi"}:
+        return "kimi"
+    # kimi-N（写成 "kimi-N"）在此会被标准化为 "kimin"，归类到 NVIDIA 提供方
+    if v in {"nvidia", "nim", "nv", "kimin"}:
         return "nvidia"
     if v in {"openrouter", "or"}:
         return "openrouter"
@@ -2194,7 +2201,9 @@ def _resolve_model_spec(model_spec: Optional[str]) -> tuple[str, str]:
 
     Supported:
     - auto/default -> ("auto", "")
-    - kimi|minimax|qwen -> ("nvidia", "<mapped model id>")
+    - kimi -> ("kimi", "")                       # 官方 Kimi（KIMI_* 环境变量）
+    - kimi-N -> ("nvidia", "moonshotai/kimi-k2-thinking")  # NVIDIA 平台提供的 Kimi
+    - minimax|qwen -> ("nvidia", "<mapped model id>")
     - qwen235b -> ("openrouter", "qwen/qwen3-235b-a22b-2507")
     - sonnet45 -> ("openrouter", "anthropic/claude-sonnet-4.5")
     - glm47 -> ("openrouter", "z-ai/glm-4.7")
@@ -2237,10 +2246,15 @@ def _resolve_model_spec(model_spec: Optional[str]) -> tuple[str, str]:
         return ("openrouter", spec)
 
     alias_map = {
-        "kimi": "moonshotai/kimi-k2-thinking",
         "minimax": "minimaxai/minimax-m2",
         "qwen": "qwen/qwen3-next-80b-a3b-instruct",
     }
+    if low == "kimi":
+        # 官方 Kimi：使用 KIMI_* 环境变量，OpenAI 兼容接口
+        return ("kimi", "")
+    if low in {"kimi-n", "kimin"}:
+        # NVIDIA 平台提供的 Kimi（兼容 OpenAI 协议）：固定映射到 moonshotai/kimi-k2-thinking
+        return ("nvidia", "moonshotai/kimi-k2-thinking")
     if low in alias_map:
         return ("nvidia", alias_map[low])
 
@@ -2296,11 +2310,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def _build_llm_with_choice(model_choice: str, *, llm_model_override: str = ""):
     """Select a single chat model based on env vars (or explicit CLI choice).
 
-    Priority when model=auto: Gemini -> DeepSeek -> NVIDIA.
+    Priority when model=auto: Gemini -> DeepSeek -> Kimi -> NVIDIA.
 
     Notes:
     - We rely on a recent `langchain-google-genai` + `google-genai` SDK that supports
       Gemini tool/function calling. We do NOT implement fallbacks to older Gemini models here.
+    - Kimi is treated as an OpenAI-compatible endpoint (base_url + api_key) using KIMI_* env vars.
     - NVIDIA is treated as an OpenAI-compatible endpoint (base_url + api_key).
     - OpenRouter is treated as an OpenAI-compatible endpoint (base_url + api_key), but uses
       OPENROUTER_API_KEY and its own base_url (defaults to https://openrouter.ai/api/v1).
@@ -2332,6 +2347,10 @@ def _build_llm_with_choice(model_choice: str, *, llm_model_override: str = ""):
     openrouter_endpoint = os.getenv("OPENROUTER_ENDPOINT") or "https://openrouter.ai/api/v1"
     openrouter_model = os.getenv("OPENROUTER_MODEL")
 
+    kimi_api_key = os.getenv("KIMI_API_KEY")
+    kimi_endpoint = os.getenv("KIMI_BASE_URL")
+    kimi_model = os.getenv("KIMI_MODEL")  # optional / unused for default; model id defaults to "kimi-k2.5"
+
     def _missing_hint_for_choice() -> str:
         if choice == "gemini":
             return (
@@ -2356,6 +2375,13 @@ def _build_llm_with_choice(model_choice: str, *, llm_model_override: str = ""):
                 "- NVIDIA_API_KEY\n"
                 "- NVIDIA_MODEL (or NVIDIA_MODEL_KIMI / NVIDIA_MODEL_MINIMAX / NVIDIA_MODEL_QWEN)\n"
             )
+        if choice == "kimi":
+            return (
+                "No LLM is configured for model=kimi.\n\n"
+                "Set:\n"
+                "- KIMI_API_KEY\n"
+                "- KIMI_BASE_URL\n"
+            )
         if choice == "openrouter":
             return (
                 "No LLM is configured for model=openrouter.\n\n"
@@ -2366,7 +2392,7 @@ def _build_llm_with_choice(model_choice: str, *, llm_model_override: str = ""):
             )
         return (
             "Unknown -model value.\n\n"
-            "Use one of: auto | gemini | deepSeek | nvidia | openrouter\n"
+            "Use one of: auto | gemini | deepSeek | kimi | nvidia | openrouter\n"
         )
 
     # Gemini
@@ -2391,6 +2417,18 @@ def _build_llm_with_choice(model_choice: str, *, llm_model_override: str = ""):
             model=cast(str, chosen),
             temperature=0.5,
             max_tokens=4096,
+        )
+
+    # Kimi (OpenAI-compatible endpoint)
+    if choice in {"auto", "kimi"} and kimi_api_key and kimi_endpoint:
+        chosen = llm_model_override or "kimi-k2.5"
+        logger.info(f"Using Kimi OpenAI-compatible model: {chosen}")
+        return ChatOpenAI(
+            api_key=kimi_api_key,
+            base_url=cast(str, kimi_endpoint),
+            model=cast(str, chosen),
+            temperature=0.6,
+            max_tokens=8192,
         )
 
     # NVIDIA (OpenAI-compatible endpoint)
@@ -2431,10 +2469,13 @@ def _build_llm_with_choice(model_choice: str, *, llm_model_override: str = ""):
         "  - DEEPSEEK_API_KEY\n"
         "  - DEEPSEEK_ENDPOINT\n"
         "  - DEEPSEEK_MODEL\n"
+        "- Kimi (OpenAI compatible):\n"
+        "  - KIMI_API_KEY\n"
+        "  - KIMI_BASE_URL\n"
         "- NVIDIA (OpenAI compatible):\n"
         "  - NVIDIA_ENDPOINT\n"
         "  - NVIDIA_API_KEY\n"
-        "  - NVIDIA_MODEL (optional; or pass -model kimi/minimax/qwen)\n\n"
+        "  - NVIDIA_MODEL (optional; or pass -model minimax/qwen)\n\n"
         "- OpenRouter (OpenAI compatible):\n"
         "  - OPENROUTER_API_KEY\n"
         "  - OPENROUTER_MODEL (optional; or pass -model qwen235b / sonnet45 / glm47 / qwen/qwen3-235b-a22b-2507 / anthropic/claude-sonnet-4.5 / z-ai/glm-4.7)\n"
@@ -2442,6 +2483,7 @@ def _build_llm_with_choice(model_choice: str, *, llm_model_override: str = ""):
         "Detected presence (True/False):\n"
         f"- GEMINI_API_KEY: {bool(gemini_api_key)}; GEMINI_MODEL_FLASH30/20/15: {bool(gemini_model)}\n"
         f"- DEEPSEEK_API_KEY: {bool(deepseek_api_key)}; DEEPSEEK_ENDPOINT: {bool(deepseek_endpoint)}; DEEPSEEK_MODEL: {bool(deepseek_model)}\n"
+        f"- KIMI_API_KEY: {bool(kimi_api_key)}; KIMI_BASE_URL: {bool(kimi_endpoint)}; KIMI_MODEL: {bool(kimi_model)}\n"
         f"- NVIDIA_API_KEY: {bool(nvidia_api_key)}; NVIDIA_ENDPOINT: {bool(nvidia_endpoint)}; NVIDIA_MODEL: {bool(nvidia_model)}\n"
         f"- OPENROUTER_API_KEY: {bool(openrouter_api_key)}; OPENROUTER_ENDPOINT: {bool(openrouter_endpoint)}; OPENROUTER_MODEL: {bool(openrouter_model)}\n"
     )
