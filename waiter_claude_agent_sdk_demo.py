@@ -793,6 +793,9 @@ async def _interactive(options: ClaudeAgentOptions) -> None:
     while True:
         user_input = input("\nYou: ").strip()
         if user_input.lower() == "q":
+            # Requirement: only clear state when exiting the process.
+            state_reset()
+            conversation_reset()
             return
         logger.info(f"User input: {user_input}")
         rendered = await _run_turn(user_input, options)
@@ -818,43 +821,53 @@ async def main() -> None:
     random.seed(int(args.seed))
     state_reset()
     conversation_reset()
-    allowed_tools = [
-        "mcp__waiter__restaurant_info_get",
-        "mcp__waiter__menu_query",
-        "mcp__waiter__inventory_check",
-        "mcp__waiter__note_view",
-        "mcp__waiter__note_clear",
-        "mcp__waiter__note_load_from_order",
-        "mcp__waiter__note_add_item",
-        "mcp__waiter__note_set_item_quantity",
-        "mcp__waiter__order_create_from_note",
-        "mcp__waiter__order_update_to_match_note",
-        "mcp__waiter__order_view",
-        "mcp__waiter__order_process",
-        "mcp__waiter__bill_calculate_total",
-        "mcp__waiter__payment_charge",
-    ]
-    options = ClaudeAgentOptions(system_prompt=SYSTEM_PROMPT, mcp_servers={"waiter": SERVER}, allowed_tools=allowed_tools, include_partial_messages=False, stderr=lambda s: logger.info(f"[sdk] {str(s).rstrip()}"))
-    if str(args.model or "").strip():
-        options.model = str(args.model).strip()
-    if str(args.dataset or "").strip():
-        dataset_path = Path(str(args.dataset)).expanduser()
-    else:
-        # Force using the new dataset (the legacy dataset uses an outdated tool workflow).
-        dataset_path = Path(__file__).with_name("waiter_agent_accessment_golden_dataset_v2.json")
-
-    if not dataset_path.exists():
-        raise FileNotFoundError(
-            f"Golden dataset not found: {dataset_path}. "
-            f"Create it (recommended: waiter_agent_accessment_golden_dataset_v2.json) "
-            f"or pass --dataset <path>."
+    try:
+        allowed_tools = [
+            "mcp__waiter__restaurant_info_get",
+            "mcp__waiter__menu_query",
+            "mcp__waiter__inventory_check",
+            "mcp__waiter__note_view",
+            "mcp__waiter__note_clear",
+            "mcp__waiter__note_load_from_order",
+            "mcp__waiter__note_add_item",
+            "mcp__waiter__note_set_item_quantity",
+            "mcp__waiter__order_create_from_note",
+            "mcp__waiter__order_update_to_match_note",
+            "mcp__waiter__order_view",
+            "mcp__waiter__order_process",
+            "mcp__waiter__bill_calculate_total",
+            "mcp__waiter__payment_charge",
+        ]
+        options = ClaudeAgentOptions(
+            system_prompt=SYSTEM_PROMPT,
+            mcp_servers={"waiter": SERVER},
+            allowed_tools=allowed_tools,
+            include_partial_messages=False,
+            stderr=lambda s: logger.info(f"[sdk] {str(s).rstrip()}"),
         )
-    if not args.free:
-        await _run_golden(options, dataset_path)
-        if args.no_interactive:
-            return
+        if str(args.model or "").strip():
+            options.model = str(args.model).strip()
+        if str(args.dataset or "").strip():
+            dataset_path = Path(str(args.dataset)).expanduser()
+        else:
+            # Force using the new dataset (the legacy dataset uses an outdated tool workflow).
+            dataset_path = Path(__file__).with_name("waiter_agent_accessment_golden_dataset_v2.json")
+
+        if not dataset_path.exists():
+            raise FileNotFoundError(
+                f"Golden dataset not found: {dataset_path}. "
+                f"Create it (recommended: waiter_agent_accessment_golden_dataset_v2.json) "
+                f"or pass --dataset <path>."
+            )
+        if not args.free:
+            await _run_golden(options, dataset_path)
+            if args.no_interactive:
+                return
+            # Requirement: do NOT reset after dataset run; continue into interactive with last state.
+        await _interactive(options)
+    finally:
+        # Requirement: clear state before process exit.
         state_reset()
         conversation_reset()
-    await _interactive(options)
 if __name__ == "__main__":
     asyncio.run(main())
