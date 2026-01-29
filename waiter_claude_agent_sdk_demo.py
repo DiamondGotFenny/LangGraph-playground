@@ -49,6 +49,8 @@ logger.setLevel(logging.INFO)
 if not logger.handlers:
     logger.addHandler(logging.NullHandler())
 CHAT_HISTORY: List[Tuple[str, str]] = []
+MAX_HISTORY_ROUNDS = 5  # Maximum number of recent conversation rounds to keep in prompt
+
 def conversation_reset() -> None:
     CHAT_HISTORY.clear()
 def _configure_logging() -> str:
@@ -226,6 +228,7 @@ def state_reset() -> None:
     STATE["orders"] = {}
     STATE["stocks"] = {dept: dict(items) for dept, items in INITIAL_STOCKS.items()}
     STATE["note"] = {}
+    STATE["summary"] = ""  # Summary of older conversation history beyond the sliding window
 def active_order() -> Optional[StateT]:
     order_id = STATE.get("active_order_id")
     if order_id is None:
@@ -656,10 +659,52 @@ SYSTEM_PROMPT = "\n".join([
     "Style: friendly, concise, proactive. Don't spam tools; reuse verified info already in conversation when safe.",
     "Each turn includes a [CONTEXT] block showing Active order + Note; treat it as authoritative internal state.",
 ])
-def _render_history(max_rounds: int = 12) -> str:
+async def _summarize_old_history(old_rounds: List[Tuple[str, str]], options: ClaudeAgentOptions) -> str:
+    """Summarize older conversation rounds that will be truncated from the sliding window."""
+    if not old_rounds:
+        return ""
+    
+    # Build a prompt to summarize the old conversation
+    conversation_text = []
+    for user_text, assistant_text in old_rounds:
+        conversation_text.append(f"Customer: {user_text}")
+        conversation_text.append(f"Waiter: {assistant_text}")
+    
+    summary_prompt = f"""Please provide a brief summary of the following conversation between a customer and waiter at Villa Toscana restaurant. Focus on:
+- What the customer ordered or discussed
+- Any important preferences or special requests
+- Current status of orders or interactions
+
+Conversation to summarize:
+{chr(10).join(conversation_text)}
+
+Provide a concise summary (2-3 sentences max):"""
+    
+    # Create a temporary client to get the summary (without MCP servers to avoid recursion)
+    temp_options = ClaudeAgentOptions(
+        system_prompt="You are a helpful assistant that summarizes conversations.",
+        include_partial_messages=False
+    )
+    if hasattr(options, 'model') and options.model:
+        temp_options.model = options.model
+    
+    async with ClaudeSDKClient(options=temp_options) as client:
+        await client.query(summary_prompt)
+        parts: List[str] = []
+        async for msg in client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        parts.append(block.text)
+        summary = "".join(parts).strip()
+    
+    logger.info(f"Generated summary for {len(old_rounds)} old rounds: {summary}")
+    return summary
+
+def _render_history() -> str:
     if not CHAT_HISTORY:
         return ""
-    tail = CHAT_HISTORY[-int(max_rounds) :]
+    tail = CHAT_HISTORY[-MAX_HISTORY_ROUNDS:]
     lines: List[str] = ["[HISTORY]"]
     for user_text, assistant_text in tail:
         lines.append(f"Customer: {user_text}")
@@ -667,9 +712,13 @@ def _render_history(max_rounds: int = 12) -> str:
     lines.append("[/HISTORY]")
     return "\n".join(lines).strip()
 def _build_prompt(user_text: str) -> str:
+    summary = STATE.get("summary", "").strip()
+    summary_block = f"[SUMMARY OF EARLIER CONVERSATION]\n{summary}\n[/SUMMARY]\n\n" if summary else ""
+    
     history = _render_history()
     history_block = f"{history}\n\n" if history else ""
-    return f"[CONTEXT]\n{_model_context()}\n[/CONTEXT]\n\n{history_block}Customer: {user_text}\n"
+    
+    return f"[CONTEXT]\n{_model_context()}\n[/CONTEXT]\n\n{summary_block}{history_block}Customer: {user_text}\n"
 async def _drain_response(client: ClaudeSDKClient) -> str:
     parts: List[str] = []
     async for msg in client.receive_response():
@@ -692,6 +741,29 @@ async def _run_turn(user_text: str, options: ClaudeAgentOptions) -> str:
         await client.query(prompt)
         rendered = await _drain_response(client)
     CHAT_HISTORY.append((user_text, rendered))
+    
+    # Check if we need to summarize old history to prevent unbounded growth
+    # We summarize when history exceeds MAX_HISTORY_ROUNDS by a certain buffer (e.g., +3)
+    summarization_threshold = MAX_HISTORY_ROUNDS + 3
+    if len(CHAT_HISTORY) > summarization_threshold:
+        # Calculate how many rounds to summarize (keep the most recent MAX_HISTORY_ROUNDS)
+        rounds_to_summarize = len(CHAT_HISTORY) - MAX_HISTORY_ROUNDS
+        old_rounds = CHAT_HISTORY[:rounds_to_summarize]
+        
+        logger.info(f"Summarizing {rounds_to_summarize} old conversation rounds...")
+        new_summary = await _summarize_old_history(old_rounds, options)
+        
+        # Append to existing summary
+        existing_summary = STATE.get("summary", "").strip()
+        if existing_summary:
+            STATE["summary"] = f"{existing_summary}\n\n{new_summary}"
+        else:
+            STATE["summary"] = new_summary
+        
+        # Remove summarized rounds from chat history
+        del CHAT_HISTORY[:rounds_to_summarize]
+        logger.info(f"Chat history trimmed from {len(CHAT_HISTORY) + rounds_to_summarize} to {len(CHAT_HISTORY)} rounds")
+    
     return rendered
 def _load_golden_dataset(path: Path) -> List[Dict[str, Any]]:
     try:
