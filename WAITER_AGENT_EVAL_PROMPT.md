@@ -17,7 +17,7 @@
 ### 1. 回答质量（Accuracy & Consistency）
 
 - AI 回答是否准确、一致
-- 是否违反**反幻觉协议**（ANTI-HALLUCINATION PROTOCOL）
+- 是否有产生**幻觉** （即与资料事实不符，创造不存在的内容）
 - 是否遵循**Tool Result Processing Protocol**（尤其是错误处理）
 
 ### 2. 工具调用正确性（Tool Call Correctness）
@@ -59,10 +59,9 @@
 - 输出**中文报告**，**Markdown 格式**
 - 报告文件**必须新建**，文件名格式：
   ```
-  waiter_react_agent_log_eval_{YYYYMMDD_HHMMSS}_{日志运行模型}.md
+  waiter_agent_sdk_log_eval_{YYYYMMDD_HHMMSS}.md
   ```
 - 报告内需写明：
-  - **日志运行模型**（从 log 中解析，如 `gemini-3-flash-preview`）
   - **评估所用模型名**（即你自己）
   - **报告输出途径** 报告保存到 "evaluation_reports" 文件夹
 
@@ -77,14 +76,13 @@
 ```markdown
 ## 📋 测试概览
 
-| 指标                    | 值                                       |
-| ----------------------- | ---------------------------------------- |
-| **测试日期**            | YYYY-MM-DD HH:MM:SS - HH:MM:SS           |
-| **日志运行模型**        | 从 log 解析（如 gemini-3-flash-preview） |
-| **评估所用模型**        | 你的模型名                               |
-| **Golden Dataset 条目** | X 条                                     |
-| **总 Token 使用**       | input=X / output=Y / total=Z             |
-| **运行时长**            | ≈ X 分 Y 秒                              |
+| 指标                    | 值                             |
+| ----------------------- | ------------------------------ |
+| **测试日期**            | YYYY-MM-DD HH:MM:SS - HH:MM:SS |
+| **评估所用模型**        | 你的模型名                     |
+| **Golden Dataset 条目** | X 条                           |
+| **总 Token 使用**       | input=X / output=Y / total=Z   |
+| **运行时长**            | ≈ X 分 Y 秒                    |
 ```
 
 ---
@@ -302,16 +300,16 @@
 
 ### Step 1: 代码提取
 
-从 `waiter_react_agent.py` 提取：
+从 `waiter_claude_agent_sdk.log` 提取：
 
 1. **Tools 列表**及各 tool 的：
    - `WHEN TO CALL` 条件
    - `DO NOT CALL` 条件
    - 返回值格式
 
-2. **反幻觉协议**（ANTI-HALLUCINATION PROTOCOL）的 5 个条款
+2. **是否有幻觉**
 
-3. **Tool Result Processing Protocol**的错误处理流程
+3. **Tool Result Processing**的错误处理流程
 
 4. **State Schema**：
    - `RestaurantOrderState` 字段
@@ -408,7 +406,7 @@
 
 ### 3. LLM Input 长度分析
 
-### 4. 反幻觉协议遵守情况
+### 4. 反幻觉情况
 
 ### 5. Memory/State 更新分析
 
@@ -443,7 +441,6 @@
 ---
 
 _报告生成时间：YYYY-MM-DD HH:MM:SS_
-_日志运行模型：xxx_
 _评估所用模型：xxx_
 ```
 
