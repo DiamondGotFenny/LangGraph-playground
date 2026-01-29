@@ -26,8 +26,9 @@ import logging
 import random
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 from logger_config import setup_logger
 try:
     from dotenv import find_dotenv, load_dotenv  # type: ignore
@@ -81,6 +82,205 @@ def _configure_logging() -> str:
     logger.info(f"Log file (stable): {stable_log_path}")
     logger.info(f"Log file (archive): {archive_log_path}")
     return str(stable_log_path)
+
+def _coerce_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+def _normalize_tool_name(name: str) -> str:
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("mcp__waiter__"):
+        return raw[len("mcp__waiter__"):]
+    if raw.startswith("mcp__") and "__" in raw:
+        return raw.split("__")[-1]
+    return raw
+
+def _extract_llm_token_usage_from_result(msg: ResultMessage) -> Optional[Dict[str, int]]:
+    usage = getattr(msg, "usage", None)
+    if not usage:
+        return None
+    get = usage.get if isinstance(usage, dict) else lambda k: getattr(usage, k, None)
+
+    prompt_tokens = _coerce_int(get("prompt_tokens"))
+    completion_tokens = _coerce_int(get("completion_tokens"))
+    total_tokens = _coerce_int(get("total_tokens"))
+
+    cache_hit = _coerce_int(get("prompt_cache_hit_tokens"))
+    cache_miss = _coerce_int(get("prompt_cache_miss_tokens"))
+
+    input_tokens = _coerce_int(get("input_tokens"))
+    output_tokens = _coerce_int(get("output_tokens"))
+    cache_read = _coerce_int(get("cache_read_input_tokens"))
+    cache_create = _coerce_int(get("cache_creation_input_tokens"))
+
+    if prompt_tokens is None and input_tokens is not None:
+        prompt_tokens = int(input_tokens) + int(cache_read or 0) + int(cache_create or 0)
+    if completion_tokens is None and output_tokens is not None:
+        completion_tokens = int(output_tokens)
+
+    if cache_hit is None and cache_read is not None:
+        cache_hit = int(cache_read)
+    if cache_miss is None and cache_create is not None:
+        cache_miss = int(cache_create)
+
+    if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+        total_tokens = int(prompt_tokens) + int(completion_tokens)
+
+    if (
+        prompt_tokens is None
+        and completion_tokens is None
+        and total_tokens is None
+        and cache_hit is None
+        and cache_miss is None
+    ):
+        return None
+
+    return {
+        "prompt_tokens": int(prompt_tokens or 0),
+        "completion_tokens": int(completion_tokens or 0),
+        "total_tokens": int(total_tokens or ((prompt_tokens or 0) + (completion_tokens or 0))),
+        "cache_hit": int(cache_hit or 0),
+        "cache_miss": int(cache_miss or 0),
+    }
+
+@dataclass
+class ToolUsageTracker:
+    tool_call_counts: Dict[str, int] = field(default_factory=dict)
+    llm_responses: List[Dict[str, Any]] = field(default_factory=list)
+    llm_token_totals: Dict[str, int] = field(
+        default_factory=lambda: {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cache_hit": 0,
+            "cache_miss": 0,
+        }
+    )
+    llm_token_records: List[Dict[str, Any]] = field(default_factory=list)
+
+    def record_tool_invocation(self, tool_name: str) -> None:
+        name = _normalize_tool_name(tool_name)
+        if not name:
+            return
+        self.tool_call_counts[name] = int(self.tool_call_counts.get(name, 0)) + 1
+
+    def record_llm_response(self, tool_names: List[str]) -> None:
+        normalized = [_normalize_tool_name(n) for n in tool_names if n]
+        seen: Set[str] = set()
+        unique_names: List[str] = []
+        for n in normalized:
+            if n in seen:
+                continue
+            seen.add(n)
+            unique_names.append(n)
+        self.llm_responses.append(
+            {
+                "index": len(self.llm_responses) + 1,
+                "has_tools": bool(normalized),
+                "tool_calls_count": len(normalized),
+                "tool_names": unique_names,
+            }
+        )
+
+    def record_llm_usage(self, usage: Optional[Dict[str, int]]) -> None:
+        usage = usage or {}
+        record = {
+            "index": len(self.llm_token_records) + 1,
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+            "cache_hit": int(usage.get("cache_hit") or 0),
+            "cache_miss": int(usage.get("cache_miss") or 0),
+        }
+        self.llm_token_records.append(record)
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens", "cache_hit", "cache_miss"):
+            self.llm_token_totals[k] = int(self.llm_token_totals.get(k) or 0) + int(record[k])
+
+    def _render_tool_efficiency_table(self) -> str:
+        total = sum(int(v) for v in self.tool_call_counts.values())
+        lines: List[str] = []
+        lines.append("工具调用效率统计")
+        lines.append("")
+        lines.append("| 工具名称 | 调用次数 | 占比 |")
+        lines.append("| --- | ---: | ---: |")
+        items = sorted(self.tool_call_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+        for name, count in items:
+            pct = (float(count) / float(total) * 100.0) if total else 0.0
+            lines.append(f"| {name} | {int(count)} | {pct:.1f}% |")
+        lines.append(f"| **总计** | **{int(total)}** | **100.0%** |" if total else "| **总计** | **0** | **0.0%** |")
+        return "\n".join(lines)
+
+    def _render_llm_tool_usage_table(self) -> str:
+        lines: List[str] = []
+        lines.append("LLM回答工具调用统计")
+        lines.append("")
+        lines.append("| 序号 | 是否调用工具 | 工具列表 | tool_calls数量 |")
+        lines.append("| ---: | --- | --- | ---: |")
+        for row in self.llm_responses:
+            has_tools = "是" if row.get("has_tools") else "否"
+            tools = row.get("tool_names") or []
+            tools_str = ", ".join(tools) if isinstance(tools, list) else ""
+            count = int(row.get("tool_calls_count") or 0)
+            lines.append(f"| {int(row.get('index') or 0)} | {has_tools} | {tools_str} | {count} |")
+        if not self.llm_responses:
+            lines.append("| 0 | 否 |  | 0 |")
+        return "\n".join(lines)
+
+    def _render_llm_token_usage_table(self) -> str:
+        lines: List[str] = []
+        lines.append("LLM Token 使用统计")
+        lines.append("")
+        lines.append("| 序号 | prompt_tokens | completion_tokens | total_tokens | cache_hit | cache_miss |")
+        lines.append("| ---: | ---: | ---: | ---: | ---: | ---: |")
+        if not self.llm_token_records:
+            lines.append("| 0 | 0 | 0 | 0 | 0 | 0 |")
+        else:
+            for row in self.llm_token_records:
+                lines.append(
+                    "| {idx} | {p} | {c} | {t} | {hit} | {miss} |".format(
+                        idx=int(row.get("index") or 0),
+                        p=int(row.get("prompt_tokens") or 0),
+                        c=int(row.get("completion_tokens") or 0),
+                        t=int(row.get("total_tokens") or 0),
+                        hit=int(row.get("cache_hit") or 0),
+                        miss=int(row.get("cache_miss") or 0),
+                    )
+                )
+        totals = self.llm_token_totals or {}
+        lines.append(
+            "| **总计** | **{p}** | **{c}** | **{t}** | **{hit}** | **{miss}** |".format(
+                p=int(totals.get("prompt_tokens") or 0),
+                c=int(totals.get("completion_tokens") or 0),
+                t=int(totals.get("total_tokens") or 0),
+                hit=int(totals.get("cache_hit") or 0),
+                miss=int(totals.get("cache_miss") or 0),
+            )
+        )
+        return "\n".join(lines)
+
+    def render_report(self) -> str:
+        parts = [
+            "",
+            "====================",
+            self._render_llm_token_usage_table(),
+            "",
+            self._render_tool_efficiency_table(),
+            "",
+            self._render_llm_tool_usage_table(),
+            "====================",
+            "",
+        ]
+        return "\n".join(parts)
+
+_TOOL_USAGE = ToolUsageTracker()
 # Menu structure with prices integrated
 FOOD_MENU: Dict[str, Dict[str, Any]] = {
     # Appetizers
@@ -518,6 +718,7 @@ def _tool_text(text: str, *, is_error: bool = False) -> Dict[str, Any]:
 @tool("restaurant_info_get", "Get restaurant info (history, awards).", {})
 async def restaurant_info_get(_args: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("tool_call: restaurant_info_get args={}")
+    _TOOL_USAGE.record_tool_invocation("restaurant_info_get")
     return _tool_text(RESTAURANT_INFO_TEXT)
 
 @tool(
@@ -530,6 +731,7 @@ async def menu_query(args: Dict[str, Any]) -> Dict[str, Any]:
     item_name = str(args.get("item_name") or "").strip()
     
     logger.info(f"tool_call: menu_query args={json.dumps({'menu_type': menu_type, 'item_name': item_name}, ensure_ascii=False)}")
+    _TOOL_USAGE.record_tool_invocation("menu_query")
     
     # If item_name is provided, query specific item
     if item_name:
@@ -569,20 +771,24 @@ async def inventory_check_tool(args: Dict[str, Any]) -> Dict[str, Any]:
     name = str(args.get("name") or "")
     quantity = int(args.get("quantity") or 0)
     logger.info(f"tool_call: inventory_check args={json.dumps({'name': name, 'quantity': quantity}, ensure_ascii=False)}")
+    _TOOL_USAGE.record_tool_invocation("inventory_check")
     ok, out = inventory_check(name, quantity)
     return _tool_text(out, is_error=not ok)
 @tool("note_view", "Show active order + note (draft).", {})
 async def note_view(_args: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("tool_call: note_view args={}")
+    _TOOL_USAGE.record_tool_invocation("note_view")
     return _tool_text(_model_context())
 @tool("note_clear", "Clear the note (draft).", {})
 async def note_clear_tool(_args: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("tool_call: note_clear args={}")
+    _TOOL_USAGE.record_tool_invocation("note_clear")
     return _tool_text(note_clear())
 @tool("note_load_from_order", "Load an order into the note (pass 0 to load active order).", {"order_id": int})
 async def note_load_from_order_tool(args: Dict[str, Any]) -> Dict[str, Any]:
     order_id = int(args.get("order_id") or 0)
     logger.info(f"tool_call: note_load_from_order args={json.dumps({'order_id': order_id}, ensure_ascii=False)}")
+    _TOOL_USAGE.record_tool_invocation("note_load_from_order")
     ok, out = note_load_from_order(order_id)
     return _tool_text(out, is_error=not ok)
 @tool("note_add_item", "Add an item to the note (draft).", {"name": str, "quantity": int, "notes": str})
@@ -591,6 +797,7 @@ async def note_add_item_tool(args: Dict[str, Any]) -> Dict[str, Any]:
     quantity = int(args.get("quantity") or 0)
     notes = str(args.get("notes") or "")
     logger.info(f"tool_call: note_add_item args={json.dumps({'name': name, 'quantity': quantity, 'notes': notes}, ensure_ascii=False)}")
+    _TOOL_USAGE.record_tool_invocation("note_add_item")
     ok, out = note_add(name, quantity, notes)
     return _tool_text(out, is_error=not ok)
 @tool("note_set_item_quantity", "Set an item's quantity in the note (0 removes).", {"name": str, "quantity": int, "notes": str})
@@ -599,33 +806,39 @@ async def note_set_item_quantity_tool(args: Dict[str, Any]) -> Dict[str, Any]:
     quantity = int(args.get("quantity") or 0)
     notes = str(args.get("notes") or "")
     logger.info(f"tool_call: note_set_item_quantity args={json.dumps({'name': name, 'quantity': quantity, 'notes': notes}, ensure_ascii=False)}")
+    _TOOL_USAGE.record_tool_invocation("note_set_item_quantity")
     ok, out = note_set_quantity(name, quantity, notes)
     return _tool_text(out, is_error=not ok)
 @tool("order_create_from_note", "Create a new order from the note (clears the note).", {})
 async def order_create_from_note_tool(_args: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("tool_call: order_create_from_note args={}")
+    _TOOL_USAGE.record_tool_invocation("order_create_from_note")
     ok, out = order_create_from_note()
     return _tool_text(out, is_error=not ok)
 @tool("order_update_to_match_note", "Update an order to match the note (clears the note). Pass 0 to update active order.", {"order_id": int})
 async def order_update_to_match_note_tool(args: Dict[str, Any]) -> Dict[str, Any]:
     order_id = int(args.get("order_id") or 0)
     logger.info(f"tool_call: order_update_to_match_note args={json.dumps({'order_id': order_id}, ensure_ascii=False)}")
+    _TOOL_USAGE.record_tool_invocation("order_update_to_match_note")
     ok, out = order_update_to_match_note(order_id)
     return _tool_text(out, is_error=not ok)
 @tool("order_view", "Show the active order summary.", {})
 async def order_view_tool(_args: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("tool_call: order_view args={}")
+    _TOOL_USAGE.record_tool_invocation("order_view")
     return _tool_text(_render_order(active_order()))
 @tool("order_process", "Process the order: fulfill pending items and report stock issues. Pass 0 for active order.", {"order_id": int})
 async def order_process_tool(args: Dict[str, Any]) -> Dict[str, Any]:
     order_id = int(args.get("order_id") or 0)
     logger.info(f"tool_call: order_process args={json.dumps({'order_id': order_id}, ensure_ascii=False)}")
+    _TOOL_USAGE.record_tool_invocation("order_process")
     ok, out = order_process(order_id)
     return _tool_text(out, is_error=not ok)
 @tool("bill_calculate_total", "Calculate the check (15% tip). Requires fulfilled order. Pass 0 for active order.", {"order_id": int})
 async def bill_calculate_total_tool(args: Dict[str, Any]) -> Dict[str, Any]:
     order_id = int(args.get("order_id") or 0)
     logger.info(f"tool_call: bill_calculate_total args={json.dumps({'order_id': order_id}, ensure_ascii=False)}")
+    _TOOL_USAGE.record_tool_invocation("bill_calculate_total")
     ok, out = bill_calculate_total(order_id)
     return _tool_text(out, is_error=not ok)
 @tool("payment_charge", "Charge payment (cash/card) for a billed order. Pass 0 for active order.", {"order_id": int, "method": str, "amount": float})
@@ -634,6 +847,7 @@ async def payment_charge_tool(args: Dict[str, Any]) -> Dict[str, Any]:
     method = str(args.get("method") or "")
     amount = float(args.get("amount") or 0.0)
     logger.info(f"tool_call: payment_charge args={json.dumps({'order_id': order_id, 'method': method, 'amount': amount}, ensure_ascii=False)}")
+    _TOOL_USAGE.record_tool_invocation("payment_charge")
     ok, out = payment_charge(order_id, method, amount)
     return _tool_text(out, is_error=not ok)
 SERVER = create_sdk_mcp_server(name="waiter", version="1.0.0", tools=[restaurant_info_get, menu_query, inventory_check_tool, note_view, note_clear_tool, note_load_from_order_tool, note_add_item_tool, note_set_item_quantity_tool, order_create_from_note_tool, order_update_to_match_note_tool, order_view_tool, order_process_tool, bill_calculate_total_tool, payment_charge_tool])
@@ -719,8 +933,10 @@ def _build_prompt(user_text: str) -> str:
     history_block = f"{history}\n\n" if history else ""
     
     return f"[CONTEXT]\n{_model_context()}\n[/CONTEXT]\n\n{summary_block}{history_block}Customer: {user_text}\n"
-async def _drain_response(client: ClaudeSDKClient) -> str:
+async def _drain_response(client: ClaudeSDKClient) -> Tuple[str, Optional[Dict[str, int]], List[str]]:
     parts: List[str] = []
+    tool_names: List[str] = []
+    usage: Optional[Dict[str, int]] = None
     async for msg in client.receive_response():
         if isinstance(msg, AssistantMessage):
             for block in msg.content:
@@ -728,18 +944,25 @@ async def _drain_response(client: ClaudeSDKClient) -> str:
                     parts.append(block.text)
                 elif isinstance(block, ToolUseBlock):
                     logger.info(f"tool_use: {block.name} input={json.dumps(block.input, ensure_ascii=False)}")
+                    if getattr(block, "name", None):
+                        tool_names.append(str(block.name))
         elif isinstance(msg, ResultMessage):
             if msg.total_cost_usd:
                 logger.info(f"Cost USD: {msg.total_cost_usd:.6f}")
+            extracted = _extract_llm_token_usage_from_result(msg)
+            if extracted:
+                usage = extracted
     rendered = "".join(parts).strip()
     rendered = re.sub(r"[ \t]+\n", "\n", rendered)
     rendered = re.sub(r"\n{3,}", "\n\n", rendered)
-    return rendered
+    return rendered, usage, tool_names
 async def _run_turn(user_text: str, options: ClaudeAgentOptions) -> str:
     prompt = _build_prompt(user_text)
     async with ClaudeSDKClient(options=options) as client:
         await client.query(prompt)
-        rendered = await _drain_response(client)
+        rendered, usage, tool_names = await _drain_response(client)
+    _TOOL_USAGE.record_llm_response(tool_names)
+    _TOOL_USAGE.record_llm_usage(usage)
     CHAT_HISTORY.append((user_text, rendered))
     
     # Check if we need to summarize old history to prevent unbounded growth
@@ -866,6 +1089,11 @@ async def main() -> None:
             # Requirement: do NOT reset after dataset run; continue into interactive with last state.
         await _interactive(options)
     finally:
+        # Always append usage summary at the very end of the log.
+        try:
+            logger.info(_TOOL_USAGE.render_report())
+        except Exception:
+            pass
         # Requirement: clear state before process exit.
         state_reset()
         conversation_reset()
